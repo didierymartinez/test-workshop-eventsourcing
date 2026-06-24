@@ -1,12 +1,16 @@
-// 🔍 Comprueba — sección "Aplicar al levantar":
-// el estado cambia AL INSTANTE (sin recargar) gracias a que Raise ahora también aplica.
+// 🔍 Comprueba — sección "La versión es del agregado":
+// la versión vive en el agregado; Load la sube por cada hecho persistido, Raise NO.
 var store = new InMemoryEventStore();
-await store.AbrirStream<Empresa>("emp-7").AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
+var s = store.AbrirStream<Empresa>("emp-7");
+await s.AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
+await s.AppendAsync(new PlanCambiado("Premium"));
+await s.AppendAsync(new EmpresaSuspendida("falta de pago"));
 
-var emp = await store.AbrirStream<Empresa>("emp-7").GetAsync();
-Console.WriteLine($"antes:   {emp.Plan}");
-emp.CambiarPlan("Premium");
-Console.WriteLine($"después: {emp.Plan}");   // sin recargar
+var empresa = await store.AbrirStream<Empresa>("emp-7").GetAsync();
+Console.WriteLine($"cargada en versión {empresa.Version}");
+
+empresa.Reactivar();   // decide (Raise): aplica, pero NO está guardado
+Console.WriteLine($"tras decidir: versión {empresa.Version}, {empresa.UncommittedEvents.Count} sin confirmar");
 
 public class InMemoryEventStore
 {
@@ -54,7 +58,7 @@ public class EventStream<T> where T : AggregateRoot, new()
         var entidad = new T { Id = _aggregateId };
         var sobres = (await _store.GetEventsAsync(_aggregateId)).ToList();
         entidad.Load(sobres.Select(s => s.EventData));
-        _version = sobres.Count == 0 ? 0 : sobres[^1].Version;
+        _version = entidad.Version;          // 🔁 reemplaza SOLO esta línea (antes: sobres[^1].Version)
         return entidad;
     }
 
@@ -70,6 +74,7 @@ public abstract class AggregateRoot
     private readonly List<object> _uncommittedEvents = new();
 
     public string Id { get; set; } = "";
+    public int Version { get; protected set; }       // el agregado conoce su versión
 
     // los hechos que el agregado decidió pero aún no se han archivado
     public IReadOnlyList<object> UncommittedEvents => _uncommittedEvents.AsReadOnly();
@@ -85,7 +90,10 @@ public abstract class AggregateRoot
     public void Load(IEnumerable<object> historia)
     {
         foreach (var hecho in historia)
+        {
             Aplicar(hecho);
+            Version++;                                // cada hecho persistido sube la versión cargada
+        }
     }
 
     protected abstract void Aplicar(object hecho);
