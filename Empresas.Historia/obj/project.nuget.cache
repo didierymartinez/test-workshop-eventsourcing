@@ -1,8 +1,11 @@
 {
   "version": 2,
-  "dgSpecHash": "qxzkIaeIznw=",
+  "dgSpecHash": "MaDHDCqpZns=",
   "success": true,
   "projectFilePath": "/Users/didierymartinez/test-workshop-es/Empresas.Historia/Empresas.Historia.csproj",
-  "expectedPackageFiles": [],
+  "expectedPackageFiles": [
+    "/Users/didierymartinez/.nuget/packages/microsoft.extensions.dependencyinjection/10.0.9/microsoft.extensions.dependencyinjection.10.0.9.nupkg.sha512",
+    "/Users/didierymartinez/.nuget/packages/microsoft.extensions.dependencyinjection.abstractions/10.0.9/microsoft.extensions.dependencyinjection.abstractions.10.0.9.nupkg.sha512"
+  ],
   "logs": []
 }

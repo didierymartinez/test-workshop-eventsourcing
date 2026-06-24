@@ -13,3 +13,7 @@
 /Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.pdb
 /Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.genruntimeconfig.cache
 /Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/ref/Empresas.Historia.dll
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/bin/Debug/net10.0/Microsoft.Extensions.DependencyInjection.dll
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/bin/Debug/net10.0/Microsoft.Extensions.DependencyInjection.Abstractions.dll
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.csproj.AssemblyReference.cache
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.489DC9DB.Up2Date

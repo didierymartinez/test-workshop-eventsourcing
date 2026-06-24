@@ -1,17 +1,46 @@
-// El tiempo de espera (async/await) — async de cabo a rabo
+// De new al contenedor (Inyección de Dependencias)
 
-var store = new InMemoryEventStore();
+using Microsoft.Extensions.DependencyInjection;
 
-var seed = store.AbrirStream<Empresa>("emp-7");
-await seed.AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
+var services = new ServiceCollection();
 
-await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
+services.AddSingleton<InMemoryEventStore>();   // UNO solo para toda la app
+services.AddTransient<SuspenderHandler>();     // uno NUEVO cada vez que lo pidan
 
-var andes = await store.AbrirStream<Empresa>("emp-7").GetAsync();
-Console.WriteLine($"{andes.Id}: {andes.Nombre}, {(andes.Suspendida ? "suspendida" : "activa")}");
+var proveedor = services.BuildServiceProvider();
+
+// pedimos el handler: el recepcionista lee su constructor, fabrica el InMemoryEventStore y se lo inyecta
+var handler = proveedor.GetRequiredService<SuspenderHandler>();
+await handler.HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
+
+Console.WriteLine("Handler resuelto por el contenedor y ejecutado.");
+
+// Mini-contenedor de juguete: para ver que un contenedor no es magia
+var c = new MiniContenedor();
+var handler2 = c.Resolver<SuspenderHandler>();   // lee su ctor, fabrica el InMemoryEventStore, lo inyecta
+Console.WriteLine($"MiniContenedor resolvió: {handler2.GetType().Name}");
 
 
 // ---- clases y records al final ----
+
+public class MiniContenedor
+{
+    private readonly Dictionary<Type, Type> _registro = new();
+
+    public void Registrar<TServicio, TImpl>() => _registro[typeof(TServicio)] = typeof(TImpl);
+
+    public object Resolver(Type tipo)
+    {
+        var concreto = _registro.TryGetValue(tipo, out var impl) ? impl : tipo;
+        var ctor = concreto.GetConstructors().First();
+        var argumentos = ctor.GetParameters()
+                             .Select(p => Resolver(p.ParameterType))
+                             .ToArray();
+        return Activator.CreateInstance(concreto, argumentos)!;
+    }
+
+    public T Resolver<T>() => (T)Resolver(typeof(T));
+}
 
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
 
@@ -137,9 +166,9 @@ public class SuspenderHandler(InMemoryEventStore store) : ICommandHandler<Suspen
     public async Task HandleAsync(SuspenderEmpresa cmd, CancellationToken ct = default)
     {
         var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
-        var empresa = await stream.GetAsync();             // 1. cargar (espera I/O)
-        var hecho   = empresa.Suspender(cmd.Motivo);       // 2. actuar (CPU, instantáneo)
-        if (hecho is not null) await stream.AppendAsync(hecho);  // 3. guardar (espera I/O)
+        var empresa = await stream.GetAsync();
+        var hecho   = empresa.Suspender(cmd.Motivo);
+        if (hecho is not null) await stream.AppendAsync(hecho);
     }
 }
 
