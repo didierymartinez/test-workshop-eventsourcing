@@ -1,73 +1,78 @@
-// 🔍 Comprueba — sección "La versión es del agregado":
-// la versión vive en el agregado; Load la sube por cada hecho persistido, Raise NO.
+// 🔍 Comprueba — sección "El almacén directo (y la Unit of Work)":
+// alta con StartStream → 2 mutaciones cargar→decidir→guardar → rehidratar, sin EventStream ni foreach de drenado.
 var store = new InMemoryEventStore();
-var s = store.AbrirStream<Empresa>("emp-7");
-await s.AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
-await s.AppendAsync(new PlanCambiado("Premium"));
-await s.AppendAsync(new EmpresaSuspendida("falta de pago"));
 
-var empresa = await store.AbrirStream<Empresa>("emp-7").GetAsync();
-Console.WriteLine($"cargada en versión {empresa.Version}");
+await new RegistrarEmpresaHandler(store).HandleAsync(new RegistrarEmpresa("emp-7", "Constructora Andes", "Básico"));
+await new CambiarPlanHandler(store).HandleAsync(new CambiarPlanDeEmpresa("emp-7", "Premium"));
+await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
 
-empresa.Reactivar();   // decide (Raise): aplica, pero NO está guardado
-Console.WriteLine($"tras decidir: versión {empresa.Version}, {empresa.UncommittedEvents.Count} sin confirmar");
+var empresa = await store.GetAggregateRootAsync<Empresa>("emp-7");
+Console.WriteLine($"{empresa!.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, versión {empresa.Version}");
 
 public class InMemoryEventStore
 {
     private readonly Dictionary<string, List<EventoAlmacenado>> _cajones = new();
 
-    public EventStream<T> AbrirStream<T>(string aggregateId) where T : AggregateRoot, new()
-        => new(this, aggregateId);
+    // La Unit of Work: recuerda qué tocaste en esta operación
+    private readonly List<AggregateRoot> _iniciados   = new();   // nacieron aquí (StartStream)
+    private readonly List<AggregateRoot> _modificados = new();   // se cargaron para mutar (Get)
 
-    public Task<IEnumerable<EventoAlmacenado>> GetEventsAsync(string aggregateId, CancellationToken ct = default) =>
-        Task.FromResult<IEnumerable<EventoAlmacenado>>(
-            _cajones.GetValueOrDefault(aggregateId) ?? Enumerable.Empty<EventoAlmacenado>());
-
-    public Task AppendEventAsync(string aggregateId, EventoAlmacenado evento, CancellationToken ct = default)
+    // ALTA: un agregado nuevo abre su stream
+    public void StartStream(AggregateRoot ar)
     {
-        var cajon = _cajones.GetValueOrDefault(aggregateId) ?? new();
-        var versionActual = cajon.Count == 0 ? 0 : cajon[^1].Version;
-        if (evento.Version != versionActual + 1)
-            throw new ConcurrencyException(
-                $"Esperaba la versión {versionActual + 1}, pero llegó la {evento.Version}.");
+        if (string.IsNullOrEmpty(ar.Id)) throw new InvalidOperationException("El agregado necesita un Id.");
+        _iniciados.Add(ar);                       // se persiste en SaveChangesAsync, no ya
+    }
 
-        _cajones[aggregateId] = cajon;
-        cajon.Add(evento);
+    // CARGA: rehidrata Y lo apunta como "tocado"
+    public Task<T?> GetAggregateRootAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot, new()
+    {
+        var cajon = _cajones.GetValueOrDefault(id);
+        if (cajon is null || cajon.Count == 0) return Task.FromResult<T?>(null);
+
+        var ar = new T { Id = id };
+        ar.Load(cajon.Select(s => s.EventData));
+        _modificados.Add(ar);                     // lo rastreo: al guardar, drenaré sus hechos
+        return Task.FromResult<T?>(ar);
+    }
+
+    public Task<bool> ExistsAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot =>
+        Task.FromResult(_cajones.TryGetValue(id, out var c) && c.Count > 0);
+
+    // GUARDA: drena los hechos pendientes de todo lo rastreado, en un solo paso
+    public Task SaveChangesAsync(CancellationToken ct = default)
+    {
+        foreach (var ar in _iniciados)
+        {
+            if (_cajones.TryGetValue(ar.Id, out var existe) && existe.Count > 0)
+                throw new ConcurrencyException($"El stream '{ar.Id}' ya existe.");
+            Volcar(ar, desdeVersion: ar.Version);
+        }
+        foreach (var ar in _modificados.Where(a => a.UncommittedEvents.Count > 0))
+        {
+            var actual = _cajones.TryGetValue(ar.Id, out var c) ? c.Count : 0;
+            if (actual != ar.Version)             // concurrencia optimista, ahora con ar.Version
+                throw new ConcurrencyException($"Esperaba la versión {ar.Version} de '{ar.Id}', pero está en {actual}.");
+            Volcar(ar, desdeVersion: ar.Version);
+        }
+        _iniciados.Clear(); _modificados.Clear();   // limpia el rastreo: la operación terminó
         return Task.CompletedTask;
+    }
+
+    private void Volcar(AggregateRoot ar, int desdeVersion)
+    {
+        var cajon = _cajones.GetValueOrDefault(ar.Id) ?? new();
+        _cajones[ar.Id] = cajon;
+        var version = desdeVersion;
+        foreach (var hecho in ar.UncommittedEvents)
+            cajon.Add(new EventoAlmacenado(++version, DateTime.UtcNow, hecho));
+        ar.ClearUncommittedEvents();
     }
 }
 
 public class ConcurrencyException(string mensaje) : Exception(mensaje);
 
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
-
-public class EventStream<T> where T : AggregateRoot, new()
-{
-    private readonly InMemoryEventStore _store;
-    private readonly string _aggregateId;
-    private int _version;
-
-    public EventStream(InMemoryEventStore store, string aggregateId)
-    {
-        _store = store;
-        _aggregateId = aggregateId;
-    }
-
-    public async Task<T> GetAsync()
-    {
-        var entidad = new T { Id = _aggregateId };
-        var sobres = (await _store.GetEventsAsync(_aggregateId)).ToList();
-        entidad.Load(sobres.Select(s => s.EventData));
-        _version = entidad.Version;          // 🔁 reemplaza SOLO esta línea (antes: sobres[^1].Version)
-        return entidad;
-    }
-
-    public async Task AppendAsync(object hecho)
-    {
-        _version++;
-        await _store.AppendEventAsync(_aggregateId, new(_version, DateTime.UtcNow, hecho));
-    }
-}
 
 public abstract class AggregateRoot
 {
@@ -108,6 +113,14 @@ public class Empresa : AggregateRoot
 
     public Empresa() { }
 
+    // ALTA: el evento de creación NO lleva id; el id es la llave del stream
+    public static Empresa Registrar(string id, string nombre, string plan)
+    {
+        var empresa = new Empresa { Id = id };
+        empresa.Raise(new EmpresaRegistrada(nombre, plan));
+        return empresa;
+    }
+
     public void CambiarPlan(string nuevoPlan)
     {
         if (Suspendida)   // validación: inválido → se RECHAZA (grita)
@@ -146,6 +159,7 @@ public class Empresa : AggregateRoot
 
 public class ReglaDeNegocioException(string mensaje) : Exception(mensaje);
 
+public record RegistrarEmpresa(string EmpresaId, string Nombre, string Plan);
 public record CambiarPlanDeEmpresa(string EmpresaId, string NuevoPlan);
 public record SuspenderEmpresa(string EmpresaId, string Motivo);
 
@@ -154,18 +168,15 @@ public interface ICommandHandler<TCommand>
     Task HandleAsync(TCommand comando, CancellationToken ct = default);
 }
 
-public class SuspenderHandler(InMemoryEventStore store) : ICommandHandler<SuspenderEmpresa>
+public class RegistrarEmpresaHandler(InMemoryEventStore store) : ICommandHandler<RegistrarEmpresa>
 {
-    public async Task HandleAsync(SuspenderEmpresa cmd, CancellationToken ct = default)
+    public async Task HandleAsync(RegistrarEmpresa cmd, CancellationToken ct = default)
     {
-        var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
-        var empresa = await stream.GetAsync();
-
-        empresa.Suspender(cmd.Motivo);                      // si es redundante, no encola nada
-
-        foreach (var hecho in empresa.UncommittedEvents)    // … y el foreach no archiva nada
-            await stream.AppendAsync(hecho);
-        empresa.ClearUncommittedEvents();
+        if (await store.ExistsAsync<Empresa>(cmd.EmpresaId, ct))   // ya tiene stream → no se registra dos veces
+            throw new InvalidOperationException($"La empresa {cmd.EmpresaId} ya existe.");
+        var empresa = Empresa.Registrar(cmd.EmpresaId, cmd.Nombre, cmd.Plan);
+        store.StartStream(empresa);
+        await store.SaveChangesAsync(ct);
     }
 }
 
@@ -173,14 +184,21 @@ public class CambiarPlanHandler(InMemoryEventStore store) : ICommandHandler<Camb
 {
     public async Task HandleAsync(CambiarPlanDeEmpresa cmd, CancellationToken ct = default)
     {
-        var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
-        var empresa = await stream.GetAsync();
+        var empresa = await store.GetAggregateRootAsync<Empresa>(cmd.EmpresaId, ct)
+                      ?? throw new InvalidOperationException($"No existe la empresa {cmd.EmpresaId}.");
+        empresa.CambiarPlan(cmd.NuevoPlan);
+        await store.SaveChangesAsync(ct);
+    }
+}
 
-        empresa.CambiarPlan(cmd.NuevoPlan);                 // decide → encola
-
-        foreach (var hecho in empresa.UncommittedEvents)    // drena lo que haya
-            await stream.AppendAsync(hecho);
-        empresa.ClearUncommittedEvents();
+public class SuspenderHandler(InMemoryEventStore store) : ICommandHandler<SuspenderEmpresa>
+{
+    public async Task HandleAsync(SuspenderEmpresa cmd, CancellationToken ct = default)
+    {
+        var empresa = await store.GetAggregateRootAsync<Empresa>(cmd.EmpresaId, ct)
+                      ?? throw new InvalidOperationException($"No existe la empresa {cmd.EmpresaId}.");
+        empresa.Suspender(cmd.Motivo);
+        await store.SaveChangesAsync(ct);
     }
 }
 
