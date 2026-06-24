@@ -65,6 +65,17 @@ if (args.Length > 0)
 
 await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de InvokeAsync (no basta Build())
 
+// ===================== §30 TestStore: rehidrata SIN base de datos (reflexión) =====================
+{
+    var store = new TestStore();
+    store.AppendPreviousEvents("emp-7",
+        new EmpresaRegistrada("Constructora Andes", "Básico"),
+        new EmpresaSuspendida("falta de pago"));
+
+    var emp = store.GetAggregateRoot<Empresa>("emp-7");
+    Console.WriteLine($"[§30] {emp!.Nombre}, plan {emp.Plan}, suspendida={emp.Suspendida} (sin Postgres)");
+}
+
 // ===================== §27 Multi-tenancy: dos tenants, el MISMO id, no se pisan =====================
 {
     var docStore = app.Services.GetRequiredService<IDocumentStore>();
@@ -226,6 +237,64 @@ public class InMemoryEventStore : IEventStore
         foreach (var hecho in ar.UncommittedEvents)
             cajon.Add(new EventoAlmacenado(++version, DateTime.UtcNow, hecho));
         ar.ClearUncommittedEvents();
+    }
+}
+
+// ===================== §30 TestStore: IEventStore en memoria para tests (rehidrata por reflexión) =====================
+public class TestStore : IEventStore
+{
+    private readonly Dictionary<string, List<object>> _previos = new();   // historia sembrada (Given)
+    private readonly Dictionary<string, List<object>> _nuevos  = new();   // hechos producidos (Then)
+    private readonly List<AggregateRoot> _rastreados = new();             // lo cargado/iniciado en esta operación
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Type, Type), System.Reflection.MethodInfo?> _cache = new();
+
+    public void AppendPreviousEvents(string id, params object[] eventos) =>          // Given
+        (_previos[id] = _previos.GetValueOrDefault(id) ?? new()).AddRange(eventos);
+
+    public IEnumerable<object> GetNewEvents(string id) => _nuevos.GetValueOrDefault(id) ?? [];   // Then
+
+    // --- IEventStore: lo que el handler usa (carga + rastrea; guardar drena a _nuevos) ---
+    public void StartStream(AggregateRoot ar) => _rastreados.Add(ar);
+
+    public Task<T?> GetAggregateRootAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot, new()
+    {
+        var ar = new T { Id = id };
+        if (_previos.TryGetValue(id, out var historia)) foreach (var e in historia) ApplyEvent(ar, e);   // rehidrata
+        _rastreados.Add(ar);                                                                             // rastrea
+        return Task.FromResult<T?>(ar);
+    }
+
+    public void AppendEvent(string id, object e) => (_nuevos[id] = _nuevos.GetValueOrDefault(id) ?? new()).Add(e);
+    public Task<bool> ExistsAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot
+        => Task.FromResult(_previos.ContainsKey(id));
+    public Task SaveChangesAsync(CancellationToken ct = default) { SaveChanges(); return Task.CompletedTask; }
+
+    // el "commit" del test: vuelca los hechos nuevos de lo rastreado a _nuevos (lo que Then observará)
+    public void SaveChanges()
+    {
+        foreach (var ar in _rastreados)
+        {
+            (_nuevos[ar.Id] = _nuevos.GetValueOrDefault(ar.Id) ?? new()).AddRange(ar.UncommittedEvents);
+            ar.ClearUncommittedEvents();
+        }
+        _rastreados.Clear();
+    }
+
+    // rehidrata para inspección (historia previa + hechos nuevos), aplicando por reflexión
+    public T GetAggregateRoot<T>(string id) where T : AggregateRoot, new()
+    {
+        var ar = new T { Id = id };
+        if (_previos.TryGetValue(id, out var p)) foreach (var e in p) ApplyEvent(ar, e);
+        if (_nuevos.TryGetValue(id, out var n)) foreach (var e in n) ApplyEvent(ar, e);
+        return ar;
+    }
+
+    // reflexión: halla el Apply(TipoConcreto) del agregado y lo invoca (cacheado)
+    private static void ApplyEvent<T>(T ar, object evento)
+    {
+        var metodo = _cache.GetOrAdd((typeof(T), evento.GetType()),
+            llave => llave.Item1.GetMethod("Apply", new[] { llave.Item2 }));
+        metodo?.Invoke(ar, new[] { evento });
     }
 }
 
