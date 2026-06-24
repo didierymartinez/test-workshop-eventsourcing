@@ -65,6 +65,12 @@ if (args.Length > 0)
 
 await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de InvokeAsync (no basta Build())
 
+// ===================== §32 Extension members de C# 14 =====================
+{
+    var nums = new[] { 1, 2, 3 }.AsQueryable();
+    Console.WriteLine($"[§32] ¿hay alguno > 5? {nums.HayMayorQue(5)}");
+}
+
 // ===================== §30 TestStore: rehidrata SIN base de datos (reflexión) =====================
 {
     var store = new TestStore();
@@ -639,4 +645,13 @@ public partial class EmpresaResumenProjection : SingleStreamProjection<EmpresaRe
     public void Apply(PlanCambiado e, EmpresaResumen r)      => r.Plan = e.NuevoPlan;
     public void Apply(EmpresaSuspendida e, EmpresaResumen r) => r.Suspendida = true;
     public void Apply(EmpresaReactivada e, EmpresaResumen r) => r.Suspendida = false;
+}
+
+// ===================== §32 idioma C# 14: extension(...) — receptor declarado UNA vez =====================
+public static class QueryableExtensions
+{
+    extension<T>(IQueryable<T> fuente) where T : notnull
+    {
+        public bool HayMayorQue(int x) => fuente.Cast<int>().Any(n => n > x);
+    }
 }
