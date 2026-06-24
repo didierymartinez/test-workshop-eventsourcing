@@ -1,4 +1,4 @@
-// Los primeros hechos — mi intento siguiendo el reto
+// Refactorizando el motor — mi intento siguiendo los 3 retos
 
 var historia = new List<object>
 {
@@ -15,21 +15,34 @@ Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida 
 
 // ---- clases y records al final ----
 
-public class Empresa
+public abstract class AggregateRoot
+{
+    public void Load(IEnumerable<object> historia)
+    {
+        foreach (var hecho in historia)
+            Aplicar(hecho);
+    }
+
+    protected abstract void Aplicar(object hecho);
+}
+
+public class Empresa : AggregateRoot
 {
     public string Nombre { get; private set; } = "";
     public string Plan   { get; private set; } = "";
     public bool   Suspendida    { get; private set; }
     public int    Reactivaciones { get; private set; }
 
-    public Empresa(IEnumerable<object> historia)
+    public Empresa(IEnumerable<object> historia) => Load(historia);
+
+    protected override void Aplicar(object hecho)
     {
-        foreach (var hecho in historia)
+        switch (hecho)
         {
-            if (hecho is EmpresaRegistrada r) { Nombre = r.Nombre; Plan = r.Plan; }
-            if (hecho is PlanCambiado p)      { Plan = p.NuevoPlan; }
-            if (hecho is EmpresaSuspendida)   { Suspendida = true; }
-            if (hecho is EmpresaReactivada)   { Suspendida = false; Reactivaciones++; }
+            case EmpresaRegistrada r: Nombre = r.Nombre; Plan = r.Plan; break;
+            case PlanCambiado p:      Plan = p.NuevoPlan;                break;
+            case EmpresaSuspendida:   Suspendida = true;                break;
+            case EmpresaReactivada:   Suspendida = false; Reactivaciones++; break;
         }
     }
 }
