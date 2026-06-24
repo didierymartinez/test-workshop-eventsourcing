@@ -1,22 +1,27 @@
-// El stream es dueño de la historia: anotas con Append, lees con Get().
+// El ciclo del dominio sobre un solo stream: cargar -> actuar -> guardar.
 var stream = new EventStream<Empresa>();
-stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));   // anota
-stream.Append(new PlanCambiado("Premium"));                            // anota
+stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));   // su historia previa
 
-var empresa = stream.Get();   // lee: instancia y rehidrata
-Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}");
+var empresa = stream.Get();                       // 1. CARGAR (rehidratar)
+Console.WriteLine($"[antes] plan {empresa.Plan}");
+
+var hecho = empresa.CambiarPlan("Enterprise");    // 2. ACTUAR (la empresa decide y emite el hecho)
+stream.Append(hecho);                             // 3. GUARDAR (el stream lo archiva)
+
+var verificacion = stream.Get();                  // recargamos del mismo stream
+Console.WriteLine($"[después] plan {verificacion.Plan}");
 
 // El envoltorio genérico: dueño de la lista, anota y rehidrata. (Repositorio)
 public class EventStream<T> where T : AggregateRoot, new()
 {
-    private readonly List<object> _historia = new();   // el stream es DUEÑO de su historia
+    private readonly List<object> _historia = new();
 
-    public void Append(object hecho) => _historia.Add(hecho);   // ESCRIBIR: anota un hecho
+    public void Append(object hecho) => _historia.Add(hecho);
 
-    public T Get()                                              // LEER: instancia y rehidrata
+    public T Get()
     {
         var entidad = new T();
-        entidad.Load(_historia);   // reproduce la historia
+        entidad.Load(_historia);
         return entidad;
     }
 }
@@ -33,7 +38,7 @@ public abstract class AggregateRoot
     protected abstract void Aplicar(object hecho);
 }
 
-// La empresa: hereda el motor. Constructor sin parámetros (el stream la crea vacía y la rehidrata).
+// La empresa: decide (emite hechos protegiendo reglas) y aplica (en el replay).
 public class Empresa : AggregateRoot
 {
     public string Nombre { get; private set; } = "";
@@ -41,7 +46,24 @@ public class Empresa : AggregateRoot
     public bool   Suspendida    { get; private set; }
     public int    Reactivaciones { get; private set; }
 
-    public Empresa() { }   // sin parámetros: el envoltorio la crea vacía y la rehidrata
+    public Empresa() { }
+
+    // DECIDIR: devuelve el hecho, no toca propiedades.
+    public PlanCambiado CambiarPlan(string nuevoPlan)
+    {
+        if (Suspendida)
+            throw new ReglaDeNegocioException("No se puede cambiar el plan de una empresa suspendida.");
+        return new PlanCambiado(nuevoPlan);
+    }
+
+    public EmpresaSuspendida? Suspender(string motivo)
+    {
+        if (Suspendida)
+            return null;   // ya está suspendida: idempotencia, no emitimos duplicado
+        return new EmpresaSuspendida(motivo);
+    }
+
+    public EmpresaReactivada Reactivar() => new();
 
     protected override void Aplicar(object hecho)
     {
@@ -54,6 +76,8 @@ public class Empresa : AggregateRoot
         }
     }
 }
+
+public class ReglaDeNegocioException(string mensaje) : Exception(mensaje);
 
 // Los hechos: record inmutables (el pasado en piedra)
 public record EmpresaRegistrada(string Nombre, string Plan);
