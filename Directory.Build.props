@@ -1,0 +1,7 @@
+<!-- Directory.Build.props (raíz): política de versionado para TODOS los proyectos -->
+<Project>
+  <PropertyGroup>
+    <AssemblyVersion>0.0.0.0</AssemblyVersion>
+    <FileVersion Condition="'$(Version)' != ''">$([System.Text.RegularExpressions.Regex]::Replace($(Version),'[-+].*$',''))</FileVersion>
+  </PropertyGroup>
+</Project>
