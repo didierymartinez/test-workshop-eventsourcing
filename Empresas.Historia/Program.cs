@@ -1,17 +1,51 @@
-// Todo acceso al almacén es asíncrono. Top-level statements ya son async: usamos await.
-var store = new InMemoryEventStore();
+using Microsoft.Extensions.DependencyInjection;
 
-// sembramos emp-7
-var s7 = store.AbrirStream<Empresa>("emp-7");
-await s7.AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
-await s7.AppendAsync(new PlanCambiado("Premium"));
+// --- El contenedor de DI: arma el grafo por nosotros (sin new manual) ---
+var services = new ServiceCollection();
 
-await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
+services.AddSingleton<InMemoryEventStore>();   // UNO solo para toda la app
+services.AddTransient<SuspenderHandler>();     // uno NUEVO cada vez que lo pidan
 
-var andes = await store.AbrirStream<Empresa>("emp-7").GetAsync();
-Console.WriteLine($"{andes.Id}: {andes.Nombre}, plan {andes.Plan}, {(andes.Suspendida ? "suspendida" : "activa")}");
+var proveedor = services.BuildServiceProvider();
 
-// El almacén en memoria, ahora asíncrono (Task ya completada: no hay I/O real).
+// sembramos emp-7: como el almacén es Singleton, es la MISMA instancia que recibirá el handler
+var almacen = proveedor.GetRequiredService<InMemoryEventStore>();
+await almacen.AbrirStream<Empresa>("emp-7").AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
+
+// pedimos el handler: el contenedor lee su constructor, fabrica el InMemoryEventStore y se lo inyecta
+var handler = proveedor.GetRequiredService<SuspenderHandler>();
+await handler.HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
+
+var andes = await almacen.AbrirStream<Empresa>("emp-7").GetAsync();
+Console.WriteLine($"[DI] {andes.Id}: {andes.Nombre}, {(andes.Suspendida ? "suspendida" : "activa")}");
+
+// --- El mini-contenedor de juguete: un contenedor no es magia ---
+var c = new MiniContenedor();
+var handlerMini = c.Resolver<SuspenderHandler>();   // lee su ctor, fabrica el InMemoryEventStore, lo inyecta
+Console.WriteLine($"[MiniContenedor] resolvió: {handlerMini.GetType().Name}");
+
+// Mini-contenedor: diccionario + reflexión del constructor + recursión.
+public class MiniContenedor
+{
+    private readonly Dictionary<Type, Type> _registro = new();
+
+    public void Registrar<TServicio, TImpl>() => _registro[typeof(TServicio)] = typeof(TImpl);
+
+    public object Resolver(Type tipo)
+    {
+        var concreto = _registro.TryGetValue(tipo, out var impl) ? impl : tipo;
+
+        var ctor = concreto.GetConstructors().First();
+        var argumentos = ctor.GetParameters()
+                             .Select(p => Resolver(p.ParameterType))   // recursión
+                             .ToArray();
+
+        return Activator.CreateInstance(concreto, argumentos)!;
+    }
+
+    public T Resolver<T>() => (T)Resolver(typeof(T));
+}
+
 public class InMemoryEventStore
 {
     private readonly Dictionary<string, List<EventoAlmacenado>> _cajones = new();
@@ -41,7 +75,6 @@ public class ConcurrencyException(string mensaje) : Exception(mensaje);
 
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
 
-// El EventStream, asíncrono de cabo a rabo.
 public class EventStream<T> where T : AggregateRoot, new()
 {
     private readonly InMemoryEventStore _store;
@@ -119,7 +152,6 @@ public class ReglaDeNegocioException(string mensaje) : Exception(mensaje);
 public record CambiarPlanDeEmpresa(string EmpresaId, string NuevoPlan);
 public record SuspenderEmpresa(string EmpresaId, string Motivo);
 
-// El contrato, ahora async.
 public interface ICommandHandler<TCommand>
 {
     Task HandleAsync(TCommand comando, CancellationToken ct = default);
