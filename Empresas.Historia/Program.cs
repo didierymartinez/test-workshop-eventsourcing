@@ -25,6 +25,9 @@ builder.UseWolverine(options =>
 
     options.Policies.AddMiddleware<UnitOfWorkMiddleware>();                    // el middleware en cada comando
     options.Policies.AutoApplyTransactions();                                 // commit automático por mensaje
+
+    options.Policies.UseDurableOutboxOnAllSendingEndpoints();   // §23 outbox para todo lo que sale
+    options.Policies.UseDurableInboxOnAllListeners();           // §23 inbox para todo lo que entra
 });
 
 builder.Services.AddScoped<IEventStore, MartenEventStore>();   // el swap de «Revelar Marten» SIGUE
@@ -38,15 +41,18 @@ if (args.Length > 0)
 
 await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de InvokeAsync (no basta Build())
 
-// 🔍 Comprueba (§22 senders y el sobre): quién se lleva los públicos
+// 🔍 Comprueba (§23 outbox/inbox): el relay no duplica
 {
-    var emp = Empresa.Registrar("emp-7", "Constructora Andes", "Básico");
-    emp.Suspender("falta de pago");
+    var almacen = new AlmacenConOutbox();
+    var bus = new BusEnMemoria();
+    var inbox = new Inbox();
 
-    var sender = new TestPublicEventSender();
-    await sender.PublishAsync("grupo-emp-7", emp.GetPublicEvents());
-    Console.WriteLine($"enviados al bus público: {sender.Enviados.Count} " +
-                      $"({string.Join(",", sender.Enviados.Select(e => e.GetType().Name))})");
+    almacen.GuardarConOutbox(new EmpresaSuspendida("falta de pago"));
+    Console.WriteLine($"pendientes en outbox: {almacen.Pendientes}");   // 1
+
+    almacen.DrenarOutbox(bus, inbox);
+    almacen.DrenarOutbox(bus, inbox);    // segundo drenado: nada nuevo
+    Console.WriteLine($"publicados: {bus.Publicados}, pendientes: {almacen.Pendientes}");   // 1, 0
 }
 
 // Despachamos comandos con IMessageBus.InvokeAsync — Wolverine resuelve el handler, corre el middleware y comitea.
@@ -249,6 +255,42 @@ public class TestPublicEventSender : IPublicEventSender
 }
 
 public record Sobre(object Payload, string TenantId, string? UserId = null, string? GroupId = null);
+
+// ===================== Outbox / Inbox de juguete (§23) =====================
+public class AlmacenConOutbox
+{
+    private readonly List<object> _eventos = new();
+    private readonly List<(string Id, object Msg)> _outbox = new();
+    public int Pendientes => _outbox.Count;           // cuántos mensajes esperan en la bandeja
+
+    public void GuardarConOutbox(object hecho)        // el hecho y su mensaje, en la MISMA operación
+    {
+        _eventos.Add(hecho);
+        _outbox.Add((Guid.NewGuid().ToString(), hecho));
+    }
+
+    public void DrenarOutbox(BusEnMemoria bus, Inbox inbox)   // el relay: publica y vacía
+    {
+        foreach (var (id, msg) in _outbox.ToList())
+        {
+            if (!inbox.YaProcesado(id)) bus.Publicar(id, msg);   // exactly-once de PROCESAMIENTO: el inbox evita reprocesar
+            _outbox.RemoveAll(p => p.Id == id);
+        }
+    }
+}
+
+public class Inbox    // idempotencia del consumidor: ids ya vistos
+{
+    private readonly HashSet<string> _procesados = new();
+    public bool YaProcesado(string id) => !_procesados.Add(id);
+}
+
+// el "broker" de juguete: en producción es RabbitMQ / Azure Service Bus
+public class BusEnMemoria
+{
+    public int Publicados { get; private set; }
+    public void Publicar(string id, object msg) => Publicados++;
+}
 
 public abstract class AggregateRoot
 {
