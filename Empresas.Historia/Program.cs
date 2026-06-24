@@ -1,51 +1,53 @@
-using Microsoft.Extensions.DependencyInjection;
 using Marten;
 using JasperFx.Events;
+using Wolverine;
+using Wolverine.Marten;
+using Microsoft.Extensions.DependencyInjection;
 
-// --- Configuración de Marten (en el arranque), con el Postgres de «Docker y PostgreSQL» ---
-var services = new ServiceCollection();
+// 🆕 De consola a app web: el host ahora es un WebApplicationBuilder (mismo contenedor de DI + servidor web).
+var builder = WebApplication.CreateBuilder(args);
 
-services.AddMarten(options =>
+builder.UseWolverine(options =>
 {
-    options.Connection("Host=localhost;Port=5432;Database=gestion_eventstore;Username=gestion;Password=dev_local_pwd");
-    options.UseSystemTextJsonForSerialization();
-    options.Events.StreamIdentity   = StreamIdentity.AsString;          // la llave del stream es string (tu Id)
-    options.Events.EventNamingStyle = EventNamingStyle.SmarterTypeName; // guarda el nombre del tipo de evento
-}).UseLightweightSessions();
+    options.Discovery.IncludeAssembly(typeof(CambiarPlanHandler).Assembly);  // descubre tus handlers
+    options.UseRuntimeCompilation();                                          // genera el código del despacho
 
-// EL SWAP: una línea — antes era InMemoryEventStore
-services.AddScoped<IEventStore, MartenEventStore>();
+    options.Services.AddMarten(m =>
+    {
+        m.Connection("Host=localhost;Port=5432;Database=gestion_eventstore;Username=gestion;Password=dev_local_pwd");
+        m.UseSystemTextJsonForSerialization();
+        m.Events.StreamIdentity   = StreamIdentity.AsString;
+        m.Events.EventNamingStyle = EventNamingStyle.SmarterTypeName;
+    })
+    .UseLightweightSessions()
+    .IntegrateWithWolverine();                                                // Marten + outbox/inbox
 
-services.AddScoped<RegistrarEmpresaHandler>();
-services.AddScoped<CambiarPlanHandler>();
-services.AddScoped<SuspenderHandler>();
+    options.Policies.AddMiddleware<UnitOfWorkMiddleware>();                    // el middleware en cada comando
+    options.Policies.AutoApplyTransactions();                                 // commit automático por mensaje
+});
 
-await using var proveedor = services.BuildServiceProvider();
+builder.Services.AddScoped<IEventStore, MartenEventStore>();   // el swap de «Revelar Marten» SIGUE
 
-// Misma operación de «El almacén directo», ahora contra Postgres real vía Marten:
-await using (var scope = proveedor.CreateAsyncScope())
+var app = builder.Build();
+await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de InvokeAsync (no basta Build())
+
+// Despachamos comandos con IMessageBus.InvokeAsync — Wolverine resuelve el handler, corre el middleware y comitea.
+await using (var scope = app.Services.CreateAsyncScope())
 {
-    var sp = scope.ServiceProvider;
-    await sp.GetRequiredService<RegistrarEmpresaHandler>()
-            .HandleAsync(new RegistrarEmpresa("emp-7", "Constructora Andes", "Básico"));
+    var bus = scope.ServiceProvider.GetRequiredService<IMessageBus>();
+    await bus.InvokeAsync(new RegistrarEmpresa("emp-7", "Constructora Andes", "Básico"));
+    await bus.InvokeAsync(new CambiarPlanDeEmpresa("emp-7", "Premium"));
+    await bus.InvokeAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
 }
-await using (var scope = proveedor.CreateAsyncScope())
-{
-    await scope.ServiceProvider.GetRequiredService<CambiarPlanHandler>()
-            .HandleAsync(new CambiarPlanDeEmpresa("emp-7", "Premium"));
-}
-await using (var scope = proveedor.CreateAsyncScope())
-{
-    await scope.ServiceProvider.GetRequiredService<SuspenderHandler>()
-            .HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
-}
 
-await using (var scope = proveedor.CreateAsyncScope())
+await using (var scope = app.Services.CreateAsyncScope())
 {
     var store = scope.ServiceProvider.GetRequiredService<IEventStore>();
     var empresa = await store.GetAggregateRootAsync<Empresa>("emp-7");
     Console.WriteLine($"{empresa!.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, versión {empresa.Version}");
 }
+
+await app.StopAsync();
 
 // ===================== El contrato =====================
 public interface IEventStore
@@ -57,7 +59,7 @@ public interface IEventStore
     Task<bool> ExistsAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot;
 }
 
-// ===================== Implementación 1: en memoria =====================
+// ===================== Implementación 1: en memoria (sigue aquí; fuera de Wolverine) =====================
 public class InMemoryEventStore : IEventStore
 {
     private readonly Dictionary<string, List<EventoAlmacenado>> _cajones = new();
@@ -82,7 +84,6 @@ public class InMemoryEventStore : IEventStore
         return Task.FromResult<T?>(ar);
     }
 
-    // anexar un hecho suelto a un stream rastreado (parte del contrato IEventStore)
     public void AppendEvent(string id, object hecho)
     {
         var ar = _modificados.FirstOrDefault(a => a.Id == id) ?? _iniciados.FirstOrDefault(a => a.Id == id);
@@ -124,7 +125,6 @@ public class InMemoryEventStore : IEventStore
 }
 
 // ===================== Implementación 2: Marten (Postgres real) =====================
-// El change-tracker (Unit of Work), igual que en «El almacén directo» pero como base reutilizable
 public abstract class MartenUnitOfWork
 {
     private readonly List<AggregateRoot> _modificados = [];
@@ -133,16 +133,18 @@ public abstract class MartenUnitOfWork
     public IEnumerable<AggregateRoot> ModificadosConCambios =>
         _modificados.Where(ar => ar.UncommittedEvents.Count > 0);
 
+    // la unión de todo lo tocado (para limpiar al final)
+    public IEnumerable<AggregateRoot> AggregateRoots => _iniciados.Union(_modificados);
+
     public void ClearChangeTracker() { _modificados.Clear(); _iniciados.Clear(); }
     protected void RastrearIniciado(AggregateRoot ar)   => _iniciados.Add(ar);
     protected void RastrearModificado(AggregateRoot? ar) { if (ar is not null) _modificados.Add(ar); }
 }
 
-// Marten da DOS sesiones (las registra e inyecta AddMarten): IDocumentSession (escribir) e IQuerySession (leer)
 public class MartenEventStore(IDocumentSession session, IQuerySession querySession)
     : MartenUnitOfWork, IEventStore
 {
-    public void StartStream(AggregateRoot ar)                       // tu StartStream → Marten
+    public void StartStream(AggregateRoot ar)
     {
         if (string.IsNullOrEmpty(ar.Id)) throw new ArgumentException("El agregado necesita un Id.");
         session.Events.StartStream(ar.Id, ar.UncommittedEvents);
@@ -150,20 +152,23 @@ public class MartenEventStore(IDocumentSession session, IQuerySession querySessi
     }
 
     public async Task<T?> GetAggregateRootAsync<T>(string id, CancellationToken ct = default)
-        where T : AggregateRoot, new()                             // tu rehidratar → AggregateStreamAsync
+        where T : AggregateRoot, new()
     {
         var ar = await querySession.Events.AggregateStreamAsync<T>(id, token: ct);
-        if (ar is not null) ar.Id = id;        // el id es la llave del stream: lo estampamos al cargar
+        if (ar is not null) ar.Id = id;
         RastrearModificado(ar);
         return ar;
     }
 
     public void AppendEvent(string id, object hecho) => session.Events.Append(id, hecho);
 
+    // appendear una tanda de hechos a un stream (lo usa el middleware)
+    public void AppendEvents(string id, IEnumerable<object> hechos) => session.Events.Append(id, hechos);
+
     public async Task<bool> ExistsAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot
         => await querySession.Events.FetchStreamStateAsync(id, ct) is not null;
 
-    public async Task SaveChangesAsync(CancellationToken ct = default)   // tu SaveChanges → session.SaveChangesAsync
+    public async Task SaveChangesAsync(CancellationToken ct = default)   // queda para usos FUERA de Wolverine (tests, serverless)
     {
         foreach (var ar in ModificadosConCambios)
         {
@@ -172,6 +177,26 @@ public class MartenEventStore(IDocumentSession session, IQuerySession querySessi
         }
         ClearChangeTracker();
         await session.SaveChangesAsync(ct);
+    }
+}
+
+// ===================== El middleware: prepara (no comitea; eso lo hace AutoApplyTransactions) =====================
+public class UnitOfWorkMiddleware(IEventStore eventStore)
+{
+    // DESPUÉS de que el handler corrió bien: vuelca a la sesión los hechos pendientes
+    public void After()
+    {
+        if (eventStore is not MartenEventStore m) return;
+        foreach (var ar in m.ModificadosConCambios)
+            m.AppendEvents(ar.Id, ar.UncommittedEvents);
+    }
+
+    // PASE LO QUE PASE: limpia los pendientes y el rastreo
+    public void Finally()
+    {
+        if (eventStore is not MartenEventStore m) return;
+        foreach (var ar in m.AggregateRoots) ar.ClearUncommittedEvents();
+        m.ClearChangeTracker();
     }
 }
 
@@ -184,18 +209,16 @@ public abstract class AggregateRoot
     private readonly List<object> _uncommittedEvents = new();
 
     public string Id { get; set; } = "";
-    public int Version { get; protected set; }       // el agregado conoce su versión
+    public int Version { get; protected set; }
 
     public IReadOnlyList<object> UncommittedEvents => _uncommittedEvents.AsReadOnly();
     public void ClearUncommittedEvents() => _uncommittedEvents.Clear();
-
-    // permite al almacén anexar un hecho suelto (AppendEvent del contrato)
     public void AppendUncommitted(object hecho) => _uncommittedEvents.Add(hecho);
 
     protected void Raise(object hecho)
     {
-        _uncommittedEvents.Add(hecho);   // lo recuerda
-        Aplicar(hecho);                  // …y lo aplica al estado
+        _uncommittedEvents.Add(hecho);
+        Aplicar(hecho);
     }
 
     public void Load(IEnumerable<object> historia)
@@ -269,6 +292,7 @@ public interface ICommandHandler<TCommand>
     Task HandleAsync(TCommand comando, CancellationToken ct = default);
 }
 
+// Handlers: cargar/StartStream + decidir — SIN SaveChangesAsync (lo hace el middleware + AutoApplyTransactions)
 public class RegistrarEmpresaHandler(IEventStore store) : ICommandHandler<RegistrarEmpresa>
 {
     public async Task HandleAsync(RegistrarEmpresa cmd, CancellationToken ct = default)
@@ -276,8 +300,7 @@ public class RegistrarEmpresaHandler(IEventStore store) : ICommandHandler<Regist
         if (await store.ExistsAsync<Empresa>(cmd.EmpresaId, ct))
             throw new InvalidOperationException($"La empresa {cmd.EmpresaId} ya existe.");
         var empresa = Empresa.Registrar(cmd.EmpresaId, cmd.Nombre, cmd.Plan);
-        store.StartStream(empresa);
-        await store.SaveChangesAsync(ct);
+        store.StartStream(empresa);                       // sin SaveChangesAsync
     }
 }
 
@@ -287,8 +310,7 @@ public class CambiarPlanHandler(IEventStore store) : ICommandHandler<CambiarPlan
     {
         var empresa = await store.GetAggregateRootAsync<Empresa>(cmd.EmpresaId, ct)
                       ?? throw new InvalidOperationException($"No existe la empresa {cmd.EmpresaId}.");
-        empresa.CambiarPlan(cmd.NuevoPlan);
-        await store.SaveChangesAsync(ct);
+        empresa.CambiarPlan(cmd.NuevoPlan);               // sin SaveChangesAsync
     }
 }
 
@@ -298,8 +320,7 @@ public class SuspenderHandler(IEventStore store) : ICommandHandler<SuspenderEmpr
     {
         var empresa = await store.GetAggregateRootAsync<Empresa>(cmd.EmpresaId, ct)
                       ?? throw new InvalidOperationException($"No existe la empresa {cmd.EmpresaId}.");
-        empresa.Suspender(cmd.Motivo);
-        await store.SaveChangesAsync(ct);
+        empresa.Suspender(cmd.Motivo);                    // sin SaveChangesAsync
     }
 }
 
