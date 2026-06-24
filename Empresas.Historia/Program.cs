@@ -38,6 +38,16 @@ if (args.Length > 0)
 
 await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de InvokeAsync (no basta Build())
 
+// 🔍 Comprueba (§21 público vs privado): separar las dos pilas sin store
+{
+    var emp = Empresa.Registrar("emp-7", "Constructora Andes", "Básico");
+    emp.Suspender("falta de pago");
+
+    Console.WriteLine($"sin confirmar: {emp.UncommittedEvents.Count}");
+    Console.WriteLine($"públicos: {emp.GetPublicEvents().Length} ({string.Join(",", emp.GetPublicEvents().Select(e => e.GetType().Name))})");
+    Console.WriteLine($"privados: {emp.GetPrivateEvents().Length}");
+}
+
 // Despachamos comandos con IMessageBus.InvokeAsync — Wolverine resuelve el handler, corre el middleware y comitea.
 await using (var scope = app.Services.CreateAsyncScope())
 {
@@ -212,6 +222,10 @@ public class ConcurrencyException(string mensaje) : Exception(mensaje);
 
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
 
+public interface IEvent;                          // marcador raíz: interfaz VACÍA
+public interface IPublicEvent  : IEvent;          // cruza la frontera (EDA)
+public interface IPrivateEvent : IEvent;          // interno al servicio
+
 public abstract class AggregateRoot
 {
     private readonly List<object> _uncommittedEvents = new();
@@ -222,6 +236,9 @@ public abstract class AggregateRoot
     public IReadOnlyList<object> UncommittedEvents => _uncommittedEvents.AsReadOnly();
     public void ClearUncommittedEvents() => _uncommittedEvents.Clear();
     public void AppendUncommitted(object hecho) => _uncommittedEvents.Add(hecho);
+
+    public IPublicEvent[]  GetPublicEvents()  => _uncommittedEvents.OfType<IPublicEvent>().ToArray();
+    public IPrivateEvent[] GetPrivateEvents() => _uncommittedEvents.OfType<IPrivateEvent>().ToArray();
 
     protected void Raise(object hecho)
     {
@@ -334,5 +351,5 @@ public class SuspenderHandler(IEventStore store) : ICommandHandler<SuspenderEmpr
 
 public record EmpresaRegistrada(string Nombre, string Plan);
 public record PlanCambiado(string NuevoPlan);
-public record EmpresaSuspendida(string Motivo);
-public record EmpresaReactivada();
+public record EmpresaSuspendida(string Motivo) : IPublicEvent;
+public record EmpresaReactivada()              : IPublicEvent;
