@@ -1,17 +1,31 @@
-// El Command Handler — handler por comando (record) + ICommandHandler<T> + el sobre con versión
+// El despachador — tabla tipo-de-comando -> handler, sin switch ni clases concretas
 
 var stream = new EventStream<Empresa>();
 stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));
 
-var handler = new SuspenderHandler(stream);
-handler.Handle(new SuspenderEmpresa("falta de pago"));
+var despachador = new Despachador();
+despachador.Registrar(new CambiarPlanHandler(stream));
+despachador.Registrar(new SuspenderHandler(stream));
+
+object comando = new SuspenderEmpresa("falta de pago");   // llega como object, sin más
+despachador.Enviar(comando);                              // encuentra SuspenderHandler por el tipo y lo llama
 
 Console.WriteLine(stream.Get().Suspendida ? "suspendida" : "activa");   // suspendida
 
 
 // ---- clases y records al final ----
 
-// el sobre: envuelve el hecho con su POSICIÓN en el stream y cuándo se anotó
+public class Despachador
+{
+    private readonly Dictionary<Type, Action<object>> _handlers = new();
+
+    public void Registrar<T>(ICommandHandler<T> handler)
+        => _handlers[typeof(T)] = (object comando) => handler.Handle((T)comando);
+
+    public void Enviar(object comando)
+        => _handlers[comando.GetType()](comando);
+}
+
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
 
 public class EventStream<T> where T : AggregateRoot, new()
@@ -25,7 +39,7 @@ public class EventStream<T> where T : AggregateRoot, new()
     public T Get()
     {
         var entidad = new T();
-        entidad.Load(_historia.Select(s => s.EventData));   // solo el hecho, no el sobre
+        entidad.Load(_historia.Select(s => s.EventData));
         return entidad;
     }
 }
