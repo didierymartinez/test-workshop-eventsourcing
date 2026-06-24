@@ -1,15 +1,12 @@
-// 🔍 Comprueba — sección "El agregado que acumula":
-// registrar → cambiar plan → suspender DOS veces (la 2ª es la prueba de idempotencia)
+// 🔍 Comprueba — sección "Aplicar al levantar":
+// el estado cambia AL INSTANTE (sin recargar) gracias a que Raise ahora también aplica.
 var store = new InMemoryEventStore();
 await store.AbrirStream<Empresa>("emp-7").AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
 
-await new CambiarPlanHandler(store).HandleAsync(new CambiarPlanDeEmpresa("emp-7", "Premium"));
-await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
-await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "otra vez"));   // redundante
-
-var empresa  = await store.AbrirStream<Empresa>("emp-7").GetAsync();
-var historia = await store.GetEventsAsync("emp-7");
-Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}; {historia.Count()} hechos");
+var emp = await store.AbrirStream<Empresa>("emp-7").GetAsync();
+Console.WriteLine($"antes:   {emp.Plan}");
+emp.CambiarPlan("Premium");
+Console.WriteLine($"después: {emp.Plan}");   // sin recargar
 
 public class InMemoryEventStore
 {
@@ -79,7 +76,11 @@ public abstract class AggregateRoot
     public void ClearUncommittedEvents() => _uncommittedEvents.Clear();
 
     // la empresa "levanta" un hecho: lo encola para que alguien lo persista
-    protected void Raise(object hecho) => _uncommittedEvents.Add(hecho);
+    protected void Raise(object hecho)
+    {
+        _uncommittedEvents.Add(hecho);   // lo recuerda (como en «El agregado que acumula»)
+        Aplicar(hecho);                  // …y ahora también lo aplica al estado
+    }
 
     public void Load(IEnumerable<object> historia)
     {
@@ -116,16 +117,23 @@ public class Empresa : AggregateRoot
 
     public void Reactivar() => Raise(new EmpresaReactivada());
 
+    // el dispatcher: el switch ya solo ENRUTA al Apply tipado (sigue siendo el override de la base)
     protected override void Aplicar(object hecho)
     {
         switch (hecho)
         {
-            case EmpresaRegistrada r: Nombre = r.Nombre; Plan = r.Plan; break;
-            case PlanCambiado p:      Plan = p.NuevoPlan;                break;
-            case EmpresaSuspendida:   Suspendida = true;                break;
-            case EmpresaReactivada:   Suspendida = false; Reactivaciones++; break;
+            case EmpresaRegistrada e: Apply(e); break;
+            case PlanCambiado e:      Apply(e); break;
+            case EmpresaSuspendida e: Apply(e); break;
+            case EmpresaReactivada e: Apply(e); break;
         }
     }
+
+    // un Apply por tipo: aquí vive la mutación de estado (público: la herramienta lo llamará por convención)
+    public void Apply(EmpresaRegistrada e) { Nombre = e.Nombre; Plan = e.Plan; }
+    public void Apply(PlanCambiado e)      => Plan = e.NuevoPlan;
+    public void Apply(EmpresaSuspendida e) => Suspendida = true;
+    public void Apply(EmpresaReactivada e) { Suspendida = false; Reactivaciones++; }
 }
 
 public class ReglaDeNegocioException(string mensaje) : Exception(mensaje);
