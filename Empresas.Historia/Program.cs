@@ -1,82 +1,82 @@
-// El stream con su historia previa.
-var stream = new EventStream<Empresa>();
-stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));
+// Un almacén central, muchas empresas, cada una en su cajón por id.
+var store = new InMemoryEventStore();
 
-// El despachador: registra cada handler una vez, y enruta por el TIPO del comando.
-var despachador = new Despachador();
-despachador.Registrar(new CambiarPlanHandler(stream));
-despachador.Registrar(new SuspenderHandler(stream));
+var s7 = store.AbrirStream<Empresa>("emp-7");
+s7.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));
+s7.Append(new PlanCambiado("Premium"));
 
-object comando = new SuspenderEmpresa("falta de pago");   // llega como object
-despachador.Enviar(comando);                              // encuentra SuspenderHandler por el tipo
+var s9 = store.AbrirStream<Empresa>("emp-9");
+s9.Append(new EmpresaRegistrada("Interprensa", "Básico"));
 
-Console.WriteLine(stream.Get().Suspendida ? "suspendida" : "activa");   // suspendida
+var andes = store.AbrirStream<Empresa>("emp-7").Get();
+Console.WriteLine($"{andes.Id}: {andes.Nombre}, plan {andes.Plan}");
+// emp-7: Constructora Andes, plan Premium
 
-// Pieza 1: cada comando es su propio TIPO (un record por intención).
-public record CambiarPlanDeEmpresa(string NuevoPlan);
-public record SuspenderEmpresa(string Motivo);
-
-// Pieza 2: un contrato común para tratar a todos los handlers igual.
-public interface ICommandHandler<TCommand>
+// El almacén central: un cajón de sobres por id; valida la versión al escribir.
+public class InMemoryEventStore
 {
-    void Handle(TCommand comando);
-}
+    private readonly Dictionary<string, List<EventoAlmacenado>> _cajones = new();
 
-// El despachador: una tabla tipo -> handler.
-public class Despachador
-{
-    private readonly Dictionary<Type, Action<object>> _handlers = new();
+    public EventStream<T> AbrirStream<T>(string aggregateId) where T : AggregateRoot, new()
+        => new(this, aggregateId);   // el almacén se incluye a sí mismo
 
-    public void Registrar<T>(ICommandHandler<T> handler)
-        => _handlers[typeof(T)] = (object comando) => handler.Handle((T)comando);
+    public IEnumerable<EventoAlmacenado> GetEvents(string aggregateId) =>
+        _cajones.GetValueOrDefault(aggregateId) ?? Enumerable.Empty<EventoAlmacenado>();
 
-    public void Enviar(object comando)
-        => _handlers[comando.GetType()](comando);
-}
-
-// Handlers: ahora reciben su comando (record) e implementan el contrato.
-public class CambiarPlanHandler(EventStream<Empresa> stream) : ICommandHandler<CambiarPlanDeEmpresa>
-{
-    public void Handle(CambiarPlanDeEmpresa cmd) =>
-        stream.Append(stream.Get().CambiarPlan(cmd.NuevoPlan));
-}
-
-public class SuspenderHandler(EventStream<Empresa> stream) : ICommandHandler<SuspenderEmpresa>
-{
-    public void Handle(SuspenderEmpresa cmd)
+    public void AppendEvent(string aggregateId, EventoAlmacenado evento)
     {
-        var hecho = stream.Get().Suspender(cmd.Motivo);
-        if (hecho is not null) stream.Append(hecho);
+        var cajon = _cajones.GetValueOrDefault(aggregateId) ?? new();
+        var versionActual = cajon.Count == 0 ? 0 : cajon[^1].Version;
+
+        if (evento.Version != versionActual + 1)
+            throw new ConcurrencyException(
+                $"Esperaba la versión {versionActual + 1}, pero llegó la {evento.Version}. " +
+                "Alguien escribió primero: recarga la empresa y reintenta.");
+
+        _cajones[aggregateId] = cajon;
+        cajon.Add(evento);
     }
 }
 
-// El sobre: hecho + posición (versión) + fecha.
+public class ConcurrencyException(string mensaje) : Exception(mensaje);
+
+// El sobre.
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
 
+// El EventStream ahora DELEGA en el almacén (ya no es dueño de la lista).
 public class EventStream<T> where T : AggregateRoot, new()
 {
-    private readonly List<EventoAlmacenado> _historia = new();
+    private readonly InMemoryEventStore _store;
+    private readonly string _aggregateId;
     private int _version;
 
-    public void Append(object hecho)
-        => _historia.Add(new EventoAlmacenado(++_version, DateTime.UtcNow, hecho));
+    public EventStream(InMemoryEventStore store, string aggregateId)
+    {
+        _store = store;
+        _aggregateId = aggregateId;
+    }
 
     public T Get()
     {
-        var entidad = new T();
-        entidad.Load(_historia.Select(s => s.EventData));
+        var entidad = new T { Id = _aggregateId };
+        var sobres  = _store.GetEvents(_aggregateId).ToList();
+        entidad.Load(sobres.Select(s => s.EventData));
+        _version = sobres.Count == 0 ? 0 : sobres[^1].Version;
         return entidad;
+    }
+
+    public void Append(object hecho)
+    {
+        _version++;
+        _store.AppendEvent(_aggregateId, new(_version, DateTime.UtcNow, hecho));
     }
 }
 
+// El motor de replay + el Id del agregado.
 public abstract class AggregateRoot
 {
-    public void Load(IEnumerable<object> historia)
-    {
-        foreach (var hecho in historia)
-            Aplicar(hecho);
-    }
-
+    public string Id { get; set; } = "";
+    public void Load(IEnumerable<object> historia) { foreach (var h in historia) Aplicar(h); }
     protected abstract void Aplicar(object hecho);
 }
 
@@ -118,6 +118,37 @@ public class Empresa : AggregateRoot
 }
 
 public class ReglaDeNegocioException(string mensaje) : Exception(mensaje);
+
+// El comando ahora dice de QUÉ empresa habla.
+public record CambiarPlanDeEmpresa(string EmpresaId, string NuevoPlan);
+public record SuspenderEmpresa(string EmpresaId, string Motivo);
+
+public interface ICommandHandler<TCommand>
+{
+    void Handle(TCommand comando);
+}
+
+// El handler recibe el almacén y abre el stream por id.
+public class CambiarPlanHandler(InMemoryEventStore store) : ICommandHandler<CambiarPlanDeEmpresa>
+{
+    public void Handle(CambiarPlanDeEmpresa cmd)
+    {
+        var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
+        var empresa = stream.Get();
+        stream.Append(empresa.CambiarPlan(cmd.NuevoPlan));
+    }
+}
+
+public class SuspenderHandler(InMemoryEventStore store) : ICommandHandler<SuspenderEmpresa>
+{
+    public void Handle(SuspenderEmpresa cmd)
+    {
+        var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
+        var empresa = stream.Get();
+        var hecho   = empresa.Suspender(cmd.Motivo);
+        if (hecho is not null) stream.Append(hecho);
+    }
+}
 
 public record EmpresaRegistrada(string Nombre, string Plan);
 public record PlanCambiado(string NuevoPlan);
