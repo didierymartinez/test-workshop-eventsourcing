@@ -11,22 +11,36 @@ var historia = new List<object>
 var empresa = new Empresa(historia);
 Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, reactivada {empresa.Reactivaciones} vez/veces");
 
-// La empresa es dueña de su coherencia: se reconstruye leyendo su historia.
-public class Empresa
+// El motor de replay: una sola vez, en la base.
+public abstract class AggregateRoot
+{
+    public void Load(IEnumerable<object> historia)
+    {
+        foreach (var hecho in historia)
+            Aplicar(hecho);
+    }
+
+    protected abstract void Aplicar(object hecho);
+}
+
+// La empresa: hereda el motor, aporta su propio Aplicar (switch por tipo).
+public class Empresa : AggregateRoot
 {
     public string Nombre { get; private set; } = "";
     public string Plan   { get; private set; } = "";
     public bool   Suspendida    { get; private set; }
     public int    Reactivaciones { get; private set; }
 
-    public Empresa(IEnumerable<object> historia)
+    public Empresa(IEnumerable<object> historia) => Load(historia);
+
+    protected override void Aplicar(object hecho)
     {
-        foreach (var hecho in historia)
+        switch (hecho)
         {
-            if (hecho is EmpresaRegistrada r) { Nombre = r.Nombre; Plan = r.Plan; }
-            if (hecho is PlanCambiado p)      { Plan = p.NuevoPlan; }
-            if (hecho is EmpresaSuspendida)   { Suspendida = true; }
-            if (hecho is EmpresaReactivada)   { Suspendida = false; Reactivaciones++; }
+            case EmpresaRegistrada r: Nombre = r.Nombre; Plan = r.Plan; break;
+            case PlanCambiado p:      Plan = p.NuevoPlan;                break;
+            case EmpresaSuspendida:   Suspendida = true;                break;
+            case EmpresaReactivada:   Suspendida = false; Reactivaciones++; break;
         }
     }
 }
