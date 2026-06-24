@@ -54,7 +54,7 @@ builder.Services.AddScoped<IEventStore, MartenEventStore>();   // el swap de «R
 
 // ===== §28 Resolver el tenant: no se pasa por parámetro, se resuelve del contexto =====
 builder.Services.AddHttpContextAccessor();
-builder.Services.AddScoped<ITenantResolver, TrustedHeadersTenantResolver>();
+builder.Services.AddScoped<ITenantResolver, ProxyTenantResolver>();   // §29 híbrido: HTTP o sobre del mensaje
 
 var app = builder.Build();
 
@@ -70,14 +70,17 @@ await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de Invok
     var docStore = app.Services.GetRequiredService<IDocumentStore>();
 
     // sinco/emp-7 y acme/emp-7: mismo id, tenants distintos -> sesión POR TENANT (no por parámetro)
+    // (idempotente para poder re-correr la demo: solo arranca el stream si no existe en ese tenant)
     await using (var s = docStore.LightweightSession("sinco"))
     {
-        s.Events.StartStream<Empresa>("emp-7", new EmpresaRegistrada("Constructora Andes", "Básico"));
+        if (await s.Events.FetchStreamStateAsync("emp-7") is null)
+            s.Events.StartStream<Empresa>("emp-7", new EmpresaRegistrada("Constructora Andes", "Básico"));
         await s.SaveChangesAsync();
     }
     await using (var s = docStore.LightweightSession("acme"))
     {
-        s.Events.StartStream<Empresa>("emp-7", new EmpresaRegistrada("Otra Empresa SA", "Premium"));
+        if (await s.Events.FetchStreamStateAsync("emp-7") is null)
+            s.Events.StartStream<Empresa>("emp-7", new EmpresaRegistrada("Otra Empresa SA", "Premium"));
         await s.SaveChangesAsync();
     }
 
@@ -117,6 +120,10 @@ await using (var scope = app.Services.CreateAsyncScope())
 
     // §24 Reto: publicar un IPublicEvent al broker (ejercita la ruta ToRabbitExchange + outbox durable)
     await bus.PublishAsync(new EmpresaSuspendida("falta de pago"));
+
+    // §29: el tenant viaja CON el mensaje (DeliveryOptions.TenantId) + el user_id como header del sobre
+    await bus.PublishAsync(new ProbarTenantPorMensaje("hola"),
+        new DeliveryOptions { TenantId = "acme" }.WithHeader("user_id", "u-1"));
 }
 
 await using (var scope = app.Services.CreateAsyncScope())
@@ -351,6 +358,26 @@ public class TrustedHeadersTenantResolver(IHttpContextAccessor accessor) : ITena
     }
 }
 
+// ===================== §29 El tenant viaja con el mensaje =====================
+// resolver para handlers del daemon: lee del sobre del mensaje (lo propaga Wolverine)
+public class WolverineMessageContextTenantResolver(IMessageContext messageContext) : ITenantResolver
+{
+    public string TenantId => messageContext.TenantId
+        ?? throw new InvalidOperationException("El mensaje no se publicó con DeliveryOptions.TenantId.");
+    public string UserId => messageContext.Envelope?.Headers.GetValueOrDefault("user_id")
+        ?? throw new InvalidOperationException("El mensaje no trae el header user_id.");
+}
+
+// proxy: una sola ITenantResolver, dos fuentes — elige por presencia de HttpContext
+public class ProxyTenantResolver(IMessageContext messageContext, IHttpContextAccessor accessor) : ITenantResolver
+{
+    private readonly ITenantResolver _real = accessor.HttpContext is not null
+        ? new TrustedHeadersTenantResolver(accessor)                 // hay request HTTP → headers
+        : new WolverineMessageContextTenantResolver(messageContext); // no → el sobre del mensaje
+    public string TenantId => _real.TenantId;
+    public string UserId   => _real.UserId;
+}
+
 // ===================== Outbox / Inbox de juguete (§23) =====================
 public class AlmacenConOutbox
 {
@@ -514,6 +541,19 @@ public record EmpresaRegistrada(string Nombre, string Plan);
 public record PlanCambiado(string NuevoPlan);
 public record EmpresaSuspendida(string Motivo) : IPublicEvent;
 public record EmpresaReactivada()              : IPublicEvent;
+
+// ===================== §29 verificación e2e: el tenant viaja en el sobre hasta el daemon =====================
+public record ProbarTenantPorMensaje(string Que);
+
+public class ProbarTenantPorMensajeHandler
+{
+    // Wolverine inyecta ITenantResolver; SIN HttpContext (corre en el worker), el proxy
+    // cae al WolverineMessageContextTenantResolver y lee el TenantId/user_id DEL SOBRE.
+    public void Handle(ProbarTenantPorMensaje msg, ITenantResolver tenant)
+    {
+        Console.WriteLine($"[§29] handler del daemon resolvió → tenant '{tenant.TenantId}', user '{tenant.UserId}' (sin HttpContext)");
+    }
+}
 
 // ===================== §25 CQRS: modelo de lectura + proyección =====================
 public class EmpresaResumen
