@@ -1,50 +1,15 @@
-using Microsoft.Extensions.DependencyInjection;
+// 🔍 Comprueba — sección "El agregado que acumula":
+// registrar → cambiar plan → suspender DOS veces (la 2ª es la prueba de idempotencia)
+var store = new InMemoryEventStore();
+await store.AbrirStream<Empresa>("emp-7").AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
 
-// --- El contenedor de DI: arma el grafo por nosotros (sin new manual) ---
-var services = new ServiceCollection();
+await new CambiarPlanHandler(store).HandleAsync(new CambiarPlanDeEmpresa("emp-7", "Premium"));
+await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
+await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "otra vez"));   // redundante
 
-services.AddSingleton<InMemoryEventStore>();   // UNO solo para toda la app
-services.AddTransient<SuspenderHandler>();     // uno NUEVO cada vez que lo pidan
-
-var proveedor = services.BuildServiceProvider();
-
-// sembramos emp-7: como el almacén es Singleton, es la MISMA instancia que recibirá el handler
-var almacen = proveedor.GetRequiredService<InMemoryEventStore>();
-await almacen.AbrirStream<Empresa>("emp-7").AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
-
-// pedimos el handler: el contenedor lee su constructor, fabrica el InMemoryEventStore y se lo inyecta
-var handler = proveedor.GetRequiredService<SuspenderHandler>();
-await handler.HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
-
-var andes = await almacen.AbrirStream<Empresa>("emp-7").GetAsync();
-Console.WriteLine($"[DI] {andes.Id}: {andes.Nombre}, {(andes.Suspendida ? "suspendida" : "activa")}");
-
-// --- El mini-contenedor de juguete: un contenedor no es magia ---
-var c = new MiniContenedor();
-var handlerMini = c.Resolver<SuspenderHandler>();   // lee su ctor, fabrica el InMemoryEventStore, lo inyecta
-Console.WriteLine($"[MiniContenedor] resolvió: {handlerMini.GetType().Name}");
-
-// Mini-contenedor: diccionario + reflexión del constructor + recursión.
-public class MiniContenedor
-{
-    private readonly Dictionary<Type, Type> _registro = new();
-
-    public void Registrar<TServicio, TImpl>() => _registro[typeof(TServicio)] = typeof(TImpl);
-
-    public object Resolver(Type tipo)
-    {
-        var concreto = _registro.TryGetValue(tipo, out var impl) ? impl : tipo;
-
-        var ctor = concreto.GetConstructors().First();
-        var argumentos = ctor.GetParameters()
-                             .Select(p => Resolver(p.ParameterType))   // recursión
-                             .ToArray();
-
-        return Activator.CreateInstance(concreto, argumentos)!;
-    }
-
-    public T Resolver<T>() => (T)Resolver(typeof(T));
-}
+var empresa  = await store.AbrirStream<Empresa>("emp-7").GetAsync();
+var historia = await store.GetEventsAsync("emp-7");
+Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}; {historia.Count()} hechos");
 
 public class InMemoryEventStore
 {
@@ -105,8 +70,23 @@ public class EventStream<T> where T : AggregateRoot, new()
 
 public abstract class AggregateRoot
 {
+    private readonly List<object> _uncommittedEvents = new();
+
     public string Id { get; set; } = "";
-    public void Load(IEnumerable<object> historia) { foreach (var h in historia) Aplicar(h); }
+
+    // los hechos que el agregado decidió pero aún no se han archivado
+    public IReadOnlyList<object> UncommittedEvents => _uncommittedEvents.AsReadOnly();
+    public void ClearUncommittedEvents() => _uncommittedEvents.Clear();
+
+    // la empresa "levanta" un hecho: lo encola para que alguien lo persista
+    protected void Raise(object hecho) => _uncommittedEvents.Add(hecho);
+
+    public void Load(IEnumerable<object> historia)
+    {
+        foreach (var hecho in historia)
+            Aplicar(hecho);
+    }
+
     protected abstract void Aplicar(object hecho);
 }
 
@@ -119,21 +99,22 @@ public class Empresa : AggregateRoot
 
     public Empresa() { }
 
-    public PlanCambiado CambiarPlan(string nuevoPlan)
+    public void CambiarPlan(string nuevoPlan)
     {
-        if (Suspendida)
+        if (Suspendida)   // validación: inválido → se RECHAZA (grita)
             throw new ReglaDeNegocioException("No se puede cambiar el plan de una empresa suspendida.");
-        return new PlanCambiado(nuevoPlan);
+
+        Raise(new PlanCambiado(nuevoPlan));
     }
 
-    public EmpresaSuspendida? Suspender(string motivo)
+    public void Suspender(string motivo)
     {
-        if (Suspendida)
-            return null;
-        return new EmpresaSuspendida(motivo);
+        if (Suspendida) return;   // idempotencia: redundante → NO-OP (calla, no encola)
+
+        Raise(new EmpresaSuspendida(motivo));
     }
 
-    public EmpresaReactivada Reactivar() => new();
+    public void Reactivar() => Raise(new EmpresaReactivada());
 
     protected override void Aplicar(object hecho)
     {
@@ -163,8 +144,12 @@ public class SuspenderHandler(InMemoryEventStore store) : ICommandHandler<Suspen
     {
         var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
         var empresa = await stream.GetAsync();
-        var hecho   = empresa.Suspender(cmd.Motivo);
-        if (hecho is not null) await stream.AppendAsync(hecho);
+
+        empresa.Suspender(cmd.Motivo);                      // si es redundante, no encola nada
+
+        foreach (var hecho in empresa.UncommittedEvents)    // … y el foreach no archiva nada
+            await stream.AppendAsync(hecho);
+        empresa.ClearUncommittedEvents();
     }
 }
 
@@ -174,7 +159,12 @@ public class CambiarPlanHandler(InMemoryEventStore store) : ICommandHandler<Camb
     {
         var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
         var empresa = await stream.GetAsync();
-        await stream.AppendAsync(empresa.CambiarPlan(cmd.NuevoPlan));
+
+        empresa.CambiarPlan(cmd.NuevoPlan);                 // decide → encola
+
+        foreach (var hecho in empresa.UncommittedEvents)    // drena lo que haya
+            await stream.AppendAsync(hecho);
+        empresa.ClearUncommittedEvents();
     }
 }
 
