@@ -52,6 +52,10 @@ builder.UseWolverine(options =>
 
 builder.Services.AddScoped<IEventStore, MartenEventStore>();   // el swap de «Revelar Marten» SIGUE
 
+// ===== §28 Resolver el tenant: no se pasa por parámetro, se resuelve del contexto =====
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<ITenantResolver, TrustedHeadersTenantResolver>();
+
 var app = builder.Build();
 
 // 🔍 «Reflexión vs codegen»: la línea de comandos de Wolverine/JasperFx ENCHUFADA.
@@ -324,6 +328,28 @@ public class TestPublicEventSender : IPublicEventSender
 }
 
 public record Sobre(object Payload, string TenantId, string? UserId = null, string? GroupId = null);
+
+// ===================== §28 Resolver el tenant =====================
+public interface ITenantResolver
+{
+    string TenantId { get; }
+    string UserId { get; }
+}
+
+// lee de headers HTTP que un gateway de confianza ya estampó
+public class TrustedHeadersTenantResolver(IHttpContextAccessor accessor) : ITenantResolver
+{
+    public string TenantId => Leer("X-Tenant-Id");
+    public string UserId   => Leer("X-User-Id");
+
+    private string Leer(string header)
+    {
+        var valor = accessor.HttpContext?.Request.Headers[header].FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(valor))
+            throw new InvalidOperationException($"Falta el header de contexto '{header}'.");
+        return valor;
+    }
+}
 
 // ===================== Outbox / Inbox de juguete (§23) =====================
 public class AlmacenConOutbox
