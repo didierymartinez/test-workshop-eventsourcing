@@ -1,30 +1,31 @@
-// Decidir el futuro — la empresa emite sus propios hechos (cargar -> actuar -> guardar)
+// El Command Handler — handler por comando (record) + ICommandHandler<T> + el sobre con versión
 
 var stream = new EventStream<Empresa>();
-stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));   // su historia previa
+stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));
 
-var empresa = stream.Get();                       // 1. CARGAR (rehidratar)
-Console.WriteLine($"[antes] plan {empresa.Plan}");
+var handler = new SuspenderHandler(stream);
+handler.Handle(new SuspenderEmpresa("falta de pago"));
 
-var hecho = empresa.CambiarPlan("Enterprise");    // 2. ACTUAR (la empresa decide y emite el hecho)
-stream.Append(hecho);                             // 3. GUARDAR (el stream lo archiva)
-
-var verificacion = stream.Get();                  // recargamos del mismo stream
-Console.WriteLine($"[después] plan {verificacion.Plan}");
+Console.WriteLine(stream.Get().Suspendida ? "suspendida" : "activa");   // suspendida
 
 
 // ---- clases y records al final ----
 
+// el sobre: envuelve el hecho con su POSICIÓN en el stream y cuándo se anotó
+public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
+
 public class EventStream<T> where T : AggregateRoot, new()
 {
-    private readonly List<object> _historia = new();
+    private readonly List<EventoAlmacenado> _historia = new();
+    private int _version;
 
-    public void Append(object hecho) => _historia.Add(hecho);
+    public void Append(object hecho)
+        => _historia.Add(new EventoAlmacenado(++_version, DateTime.UtcNow, hecho));
 
     public T Get()
     {
         var entidad = new T();
-        entidad.Load(_historia);
+        entidad.Load(_historia.Select(s => s.EventData));   // solo el hecho, no el sobre
         return entidad;
     }
 }
@@ -51,19 +52,15 @@ public class Empresa : AggregateRoot
 
     public PlanCambiado CambiarPlan(string nuevoPlan)
     {
-        // (a) VALIDACIÓN — la operación es inválida → se RECHAZA (es un error)
         if (Suspendida)
             throw new ReglaDeNegocioException("No se puede cambiar el plan de una empresa suspendida.");
-
         return new PlanCambiado(nuevoPlan);
     }
 
     public EmpresaSuspendida? Suspender(string motivo)
     {
-        // (b) IDEMPOTENCIA — operación válida pero redundante → NO-OP (no es un error)
         if (Suspendida)
-            return null;   // ya está suspendida: no emitimos un hecho duplicado
-
+            return null;
         return new EmpresaSuspendida(motivo);
     }
 
@@ -78,6 +75,29 @@ public class Empresa : AggregateRoot
             case EmpresaSuspendida:   Suspendida = true;                break;
             case EmpresaReactivada:   Suspendida = false; Reactivaciones++; break;
         }
+    }
+}
+
+public record CambiarPlanDeEmpresa(string NuevoPlan);
+public record SuspenderEmpresa(string Motivo);
+
+public interface ICommandHandler<TCommand>
+{
+    void Handle(TCommand comando);
+}
+
+public class CambiarPlanHandler(EventStream<Empresa> stream) : ICommandHandler<CambiarPlanDeEmpresa>
+{
+    public void Handle(CambiarPlanDeEmpresa cmd) =>
+        stream.Append(stream.Get().CambiarPlan(cmd.NuevoPlan));
+}
+
+public class SuspenderHandler(EventStream<Empresa> stream) : ICommandHandler<SuspenderEmpresa>
+{
+    public void Handle(SuspenderEmpresa cmd)
+    {
+        var hecho = stream.Get().Suspender(cmd.Motivo);
+        if (hecho is not null) stream.Append(hecho);
     }
 }
 
