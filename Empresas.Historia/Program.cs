@@ -1,19 +1,28 @@
-// Refactorizando el motor — mi intento siguiendo los 3 retos
+// El flujo de vida (EventStream) — envolvemos la historia en un EventStream<T>
 
-var historia = new List<object>
-{
-    new EmpresaRegistrada("Constructora Andes", "Básico"),
-    new PlanCambiado("Premium"),
-    new EmpresaSuspendida("falta de pago"),
-    new EmpresaReactivada(),
-    new EmpresaSuspendida("incumplimiento de contrato"),
-};
+var stream = new EventStream<Empresa>();
+stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));   // anota
+stream.Append(new PlanCambiado("Premium"));                            // anota
 
-var empresa = new Empresa(historia);
-Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, reactivada {empresa.Reactivaciones} vez/veces");
+var empresa = stream.Get();   // lee: instancia y rehidrata
+Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}");
 
 
 // ---- clases y records al final ----
+
+public class EventStream<T> where T : AggregateRoot, new()
+{
+    private readonly List<object> _historia = new();
+
+    public void Append(object hecho) => _historia.Add(hecho);
+
+    public T Get()
+    {
+        var entidad = new T();
+        entidad.Load(_historia);
+        return entidad;
+    }
+}
 
 public abstract class AggregateRoot
 {
@@ -33,7 +42,7 @@ public class Empresa : AggregateRoot
     public bool   Suspendida    { get; private set; }
     public int    Reactivaciones { get; private set; }
 
-    public Empresa(IEnumerable<object> historia) => Load(historia);
+    public Empresa() { }   // sin parámetros: el envoltorio la crea vacía y la rehidrata
 
     protected override void Aplicar(object hecho)
     {
