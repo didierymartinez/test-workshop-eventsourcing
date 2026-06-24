@@ -3,6 +3,7 @@ using JasperFx.Events;
 using Wolverine;
 using Wolverine.Marten;
 using Microsoft.Extensions.DependencyInjection;
+using JasperFx;
 
 // 🆕 De consola a app web: el host ahora es un WebApplicationBuilder (mismo contenedor de DI + servidor web).
 var builder = WebApplication.CreateBuilder(args);
@@ -29,6 +30,12 @@ builder.UseWolverine(options =>
 builder.Services.AddScoped<IEventStore, MartenEventStore>();   // el swap de «Revelar Marten» SIGUE
 
 var app = builder.Build();
+
+// 🔍 «Reflexión vs codegen»: la línea de comandos de Wolverine/JasperFx ENCHUFADA.
+// Con args (p. ej. `codegen preview`/`codegen write`) corre ese comando; sin args, corre la demo.
+if (args.Length > 0)
+    return await app.RunJasperFxCommands(args);
+
 await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de InvokeAsync (no basta Build())
 
 // Despachamos comandos con IMessageBus.InvokeAsync — Wolverine resuelve el handler, corre el middleware y comitea.
@@ -48,6 +55,7 @@ await using (var scope = app.Services.CreateAsyncScope())
 }
 
 await app.StopAsync();
+return 0;
 
 // ===================== El contrato =====================
 public interface IEventStore
