@@ -2,6 +2,7 @@ using Marten;
 using JasperFx.Events;
 using Wolverine;
 using Wolverine.Marten;
+using Wolverine.RabbitMQ;
 using Microsoft.Extensions.DependencyInjection;
 using JasperFx;
 
@@ -28,6 +29,18 @@ builder.UseWolverine(options =>
 
     options.Policies.UseDurableOutboxOnAllSendingEndpoints();   // §23 outbox para todo lo que sale
     options.Policies.UseDurableInboxOnAllListeners();           // §23 inbox para todo lo que entra
+
+    // ===== §24 Transportes: RabbitMQ real =====
+    // 1) conectar a RabbitMQ y dejar que Wolverine cree exchanges/colas
+    options.UseRabbitMqUsingNamedConnection("rabbitmq").AutoProvision();
+
+    // 2) publicar TODOS tus IPublicEvent a un exchange con el nombre de tu servicio (outbox durable)
+    var contratos = typeof(EmpresaSuspendida).Assembly;   // el ensamblado donde viven los contratos/eventos
+    foreach (var tipo in contratos.GetTypes().Where(t => t.IsAssignableTo(typeof(IPublicEvent))))
+        options.PublishMessage(tipo).ToRabbitExchange("gestion-empresas").UseDurableOutbox();
+
+    // 3) para verlo dar la vuelta SOLO: ato la cola a mi PROPIO exchange (inbox durable)
+    options.ListenToRabbitQueue("gestion-empresas.cola", c => c.BindExchange("gestion-empresas")).UseDurableInbox();
 });
 
 builder.Services.AddScoped<IEventStore, MartenEventStore>();   // el swap de «Revelar Marten» SIGUE
@@ -62,6 +75,9 @@ await using (var scope = app.Services.CreateAsyncScope())
     await bus.InvokeAsync(new RegistrarEmpresa("emp-7", "Constructora Andes", "Básico"));
     await bus.InvokeAsync(new CambiarPlanDeEmpresa("emp-7", "Premium"));
     await bus.InvokeAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
+
+    // §24 Reto: publicar un IPublicEvent al broker (ejercita la ruta ToRabbitExchange + outbox durable)
+    await bus.PublishAsync(new EmpresaSuspendida("falta de pago"));
 }
 
 await using (var scope = app.Services.CreateAsyncScope())
@@ -70,6 +86,9 @@ await using (var scope = app.Services.CreateAsyncScope())
     var empresa = await store.GetAggregateRootAsync<Empresa>("emp-7");
     Console.WriteLine($"{empresa!.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, versión {empresa.Version}");
 }
+
+Console.WriteLine("[§24] esperando a que el relay durable drene el outbox a RabbitMQ...");
+await Task.Delay(5000);   // §24 dejar respirar al relay durable (outbox -> RabbitMQ)
 
 await app.StopAsync();
 return 0;

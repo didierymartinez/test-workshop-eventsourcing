@@ -11,5 +11,12 @@ services:
     volumes:
       - eventstore_data:/var/lib/postgresql/data   # los datos sobreviven aunque el contenedor se apague
 
+  rabbitmq:
+    image: rabbitmq:4-management        # RabbitMQ 4.x + panel web de administración
+    container_name: gestion_rabbitmq
+    ports:
+      - "5672:5672"                      # AMQP — por aquí habla tu app
+      - "15672:15672"                    # panel web — http://localhost:15672 (usuario/clave: guest/guest)
+
 volumes:
   eventstore_data:
