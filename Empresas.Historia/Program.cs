@@ -1,15 +1,25 @@
-// El diario de Constructora Andes: una secuencia ordenada de hechos (un Stream).
-var historia = new List<object>
-{
-    new EmpresaRegistrada("Constructora Andes", "Básico"),
-    new PlanCambiado("Premium"),
-    new EmpresaSuspendida("falta de pago"),
-    new EmpresaReactivada(),
-    new EmpresaSuspendida("incumplimiento de contrato"),
-};
+// El stream es dueño de la historia: anotas con Append, lees con Get().
+var stream = new EventStream<Empresa>();
+stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));   // anota
+stream.Append(new PlanCambiado("Premium"));                            // anota
 
-var empresa = new Empresa(historia);
-Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, reactivada {empresa.Reactivaciones} vez/veces");
+var empresa = stream.Get();   // lee: instancia y rehidrata
+Console.WriteLine($"{empresa.Nombre}: plan {empresa.Plan}");
+
+// El envoltorio genérico: dueño de la lista, anota y rehidrata. (Repositorio)
+public class EventStream<T> where T : AggregateRoot, new()
+{
+    private readonly List<object> _historia = new();   // el stream es DUEÑO de su historia
+
+    public void Append(object hecho) => _historia.Add(hecho);   // ESCRIBIR: anota un hecho
+
+    public T Get()                                              // LEER: instancia y rehidrata
+    {
+        var entidad = new T();
+        entidad.Load(_historia);   // reproduce la historia
+        return entidad;
+    }
+}
 
 // El motor de replay: una sola vez, en la base.
 public abstract class AggregateRoot
@@ -23,7 +33,7 @@ public abstract class AggregateRoot
     protected abstract void Aplicar(object hecho);
 }
 
-// La empresa: hereda el motor, aporta su propio Aplicar (switch por tipo).
+// La empresa: hereda el motor. Constructor sin parámetros (el stream la crea vacía y la rehidrata).
 public class Empresa : AggregateRoot
 {
     public string Nombre { get; private set; } = "";
@@ -31,7 +41,7 @@ public class Empresa : AggregateRoot
     public bool   Suspendida    { get; private set; }
     public int    Reactivaciones { get; private set; }
 
-    public Empresa(IEnumerable<object> historia) => Load(historia);
+    public Empresa() { }   // sin parámetros: el envoltorio la crea vacía y la rehidrata
 
     protected override void Aplicar(object hecho)
     {
