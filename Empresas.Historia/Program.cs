@@ -1,27 +1,47 @@
-// El ciclo del dominio sobre un solo stream: cargar -> actuar -> guardar.
+// El handler orquesta cargar -> actuar -> guardar; el Program solo pide la operación.
 var stream = new EventStream<Empresa>();
-stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));   // su historia previa
+stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));
 
-var empresa = stream.Get();                       // 1. CARGAR (rehidratar)
-Console.WriteLine($"[antes] plan {empresa.Plan}");
+var handlerCambiar = new CambiarPlanHandler(stream);
+handlerCambiar.Handle("Premium");
 
-var hecho = empresa.CambiarPlan("Enterprise");    // 2. ACTUAR (la empresa decide y emite el hecho)
-stream.Append(hecho);                             // 3. GUARDAR (el stream lo archiva)
+var handlerSuspender = new SuspenderHandler(stream);
+handlerSuspender.Handle("falta de pago");
 
-var verificacion = stream.Get();                  // recargamos del mismo stream
-Console.WriteLine($"[después] plan {verificacion.Plan}");
+Console.WriteLine(stream.Get().Suspendida ? "suspendida" : "activa");   // suspendida
 
-// El envoltorio genérico: dueño de la lista, anota y rehidrata. (Repositorio)
+// Un handler por comando (responsabilidad única): cargar -> decidir -> guardar.
+public class CambiarPlanHandler(EventStream<Empresa> stream)
+{
+    public void Handle(string nuevoPlan) =>
+        stream.Append(stream.Get().CambiarPlan(nuevoPlan));
+}
+
+public class SuspenderHandler(EventStream<Empresa> stream)
+{
+    public void Handle(string motivo)
+    {
+        var hecho = stream.Get().Suspender(motivo);
+        if (hecho is not null) stream.Append(hecho);
+    }
+}
+
+// El sobre: envuelve el hecho con su POSICIÓN (versión) y cuándo se anotó.
+public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
+
+// El envoltorio genérico: ahora numera cada hecho en un sobre.
 public class EventStream<T> where T : AggregateRoot, new()
 {
-    private readonly List<object> _historia = new();
+    private readonly List<EventoAlmacenado> _historia = new();
+    private int _version;
 
-    public void Append(object hecho) => _historia.Add(hecho);
+    public void Append(object hecho)
+        => _historia.Add(new EventoAlmacenado(++_version, DateTime.UtcNow, hecho));
 
     public T Get()
     {
         var entidad = new T();
-        entidad.Load(_historia);
+        entidad.Load(_historia.Select(s => s.EventData));   // solo el hecho, no el sobre
         return entidad;
     }
 }
@@ -48,7 +68,6 @@ public class Empresa : AggregateRoot
 
     public Empresa() { }
 
-    // DECIDIR: devuelve el hecho, no toca propiedades.
     public PlanCambiado CambiarPlan(string nuevoPlan)
     {
         if (Suspendida)
@@ -59,7 +78,7 @@ public class Empresa : AggregateRoot
     public EmpresaSuspendida? Suspender(string motivo)
     {
         if (Suspendida)
-            return null;   // ya está suspendida: idempotencia, no emitimos duplicado
+            return null;
         return new EmpresaSuspendida(motivo);
     }
 
@@ -79,7 +98,6 @@ public class Empresa : AggregateRoot
 
 public class ReglaDeNegocioException(string mensaje) : Exception(mensaje);
 
-// Los hechos: record inmutables (el pasado en piedra)
 public record EmpresaRegistrada(string Nombre, string Plan);
 public record PlanCambiado(string NuevoPlan);
 public record EmpresaSuspendida(string Motivo);
