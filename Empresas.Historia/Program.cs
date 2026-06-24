@@ -38,14 +38,15 @@ if (args.Length > 0)
 
 await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de InvokeAsync (no basta Build())
 
-// 🔍 Comprueba (§21 público vs privado): separar las dos pilas sin store
+// 🔍 Comprueba (§22 senders y el sobre): quién se lleva los públicos
 {
     var emp = Empresa.Registrar("emp-7", "Constructora Andes", "Básico");
     emp.Suspender("falta de pago");
 
-    Console.WriteLine($"sin confirmar: {emp.UncommittedEvents.Count}");
-    Console.WriteLine($"públicos: {emp.GetPublicEvents().Length} ({string.Join(",", emp.GetPublicEvents().Select(e => e.GetType().Name))})");
-    Console.WriteLine($"privados: {emp.GetPrivateEvents().Length}");
+    var sender = new TestPublicEventSender();
+    await sender.PublishAsync("grupo-emp-7", emp.GetPublicEvents());
+    Console.WriteLine($"enviados al bus público: {sender.Enviados.Count} " +
+                      $"({string.Join(",", sender.Enviados.Select(e => e.GetType().Name))})");
 }
 
 // Despachamos comandos con IMessageBus.InvokeAsync — Wolverine resuelve el handler, corre el middleware y comitea.
@@ -225,6 +226,29 @@ public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData
 public interface IEvent;                          // marcador raíz: interfaz VACÍA
 public interface IPublicEvent  : IEvent;          // cruza la frontera (EDA)
 public interface IPrivateEvent : IEvent;          // interno al servicio
+
+// ===================== Senders y el sobre (§22) =====================
+public interface IPublicEventSender
+{
+    Task PublishAsync(params IPublicEvent[] eventos);
+    Task PublishAsync(string groupId, params IPublicEvent[] eventos);   // groupId = orden FIFO por grupo
+}
+public interface IPrivateEventSender
+{
+    Task PublishAsync(params IPrivateEvent[] eventos);
+    Task PublishAsync(string groupId, params IPrivateEvent[] eventos);
+}
+
+// en memoria: acumula lo enviado (para inspeccionar / para tests)
+public class TestPublicEventSender : IPublicEventSender
+{
+    private readonly List<IPublicEvent> _enviados = new();
+    public IReadOnlyList<IPublicEvent> Enviados => _enviados.AsReadOnly();
+    public Task PublishAsync(params IPublicEvent[] eventos)               { _enviados.AddRange(eventos); return Task.CompletedTask; }
+    public Task PublishAsync(string groupId, params IPublicEvent[] eventos) { _enviados.AddRange(eventos); return Task.CompletedTask; }
+}
+
+public record Sobre(object Payload, string TenantId, string? UserId = null, string? GroupId = null);
 
 public abstract class AggregateRoot
 {
