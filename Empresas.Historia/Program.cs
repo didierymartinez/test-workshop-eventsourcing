@@ -1,49 +1,47 @@
-// Un almacén central, muchas empresas, cada una en su cajón por id.
+// Todo acceso al almacén es asíncrono. Top-level statements ya son async: usamos await.
 var store = new InMemoryEventStore();
 
+// sembramos emp-7
 var s7 = store.AbrirStream<Empresa>("emp-7");
-s7.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));
-s7.Append(new PlanCambiado("Premium"));
+await s7.AppendAsync(new EmpresaRegistrada("Constructora Andes", "Básico"));
+await s7.AppendAsync(new PlanCambiado("Premium"));
 
-var s9 = store.AbrirStream<Empresa>("emp-9");
-s9.Append(new EmpresaRegistrada("Interprensa", "Básico"));
+await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
 
-var andes = store.AbrirStream<Empresa>("emp-7").Get();
-Console.WriteLine($"{andes.Id}: {andes.Nombre}, plan {andes.Plan}");
-// emp-7: Constructora Andes, plan Premium
+var andes = await store.AbrirStream<Empresa>("emp-7").GetAsync();
+Console.WriteLine($"{andes.Id}: {andes.Nombre}, plan {andes.Plan}, {(andes.Suspendida ? "suspendida" : "activa")}");
 
-// El almacén central: un cajón de sobres por id; valida la versión al escribir.
+// El almacén en memoria, ahora asíncrono (Task ya completada: no hay I/O real).
 public class InMemoryEventStore
 {
     private readonly Dictionary<string, List<EventoAlmacenado>> _cajones = new();
 
     public EventStream<T> AbrirStream<T>(string aggregateId) where T : AggregateRoot, new()
-        => new(this, aggregateId);   // el almacén se incluye a sí mismo
+        => new(this, aggregateId);
 
-    public IEnumerable<EventoAlmacenado> GetEvents(string aggregateId) =>
-        _cajones.GetValueOrDefault(aggregateId) ?? Enumerable.Empty<EventoAlmacenado>();
+    public Task<IEnumerable<EventoAlmacenado>> GetEventsAsync(string aggregateId, CancellationToken ct = default) =>
+        Task.FromResult<IEnumerable<EventoAlmacenado>>(
+            _cajones.GetValueOrDefault(aggregateId) ?? Enumerable.Empty<EventoAlmacenado>());
 
-    public void AppendEvent(string aggregateId, EventoAlmacenado evento)
+    public Task AppendEventAsync(string aggregateId, EventoAlmacenado evento, CancellationToken ct = default)
     {
         var cajon = _cajones.GetValueOrDefault(aggregateId) ?? new();
         var versionActual = cajon.Count == 0 ? 0 : cajon[^1].Version;
-
         if (evento.Version != versionActual + 1)
             throw new ConcurrencyException(
-                $"Esperaba la versión {versionActual + 1}, pero llegó la {evento.Version}. " +
-                "Alguien escribió primero: recarga la empresa y reintenta.");
+                $"Esperaba la versión {versionActual + 1}, pero llegó la {evento.Version}.");
 
         _cajones[aggregateId] = cajon;
         cajon.Add(evento);
+        return Task.CompletedTask;
     }
 }
 
 public class ConcurrencyException(string mensaje) : Exception(mensaje);
 
-// El sobre.
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
 
-// El EventStream ahora DELEGA en el almacén (ya no es dueño de la lista).
+// El EventStream, asíncrono de cabo a rabo.
 public class EventStream<T> where T : AggregateRoot, new()
 {
     private readonly InMemoryEventStore _store;
@@ -56,23 +54,22 @@ public class EventStream<T> where T : AggregateRoot, new()
         _aggregateId = aggregateId;
     }
 
-    public T Get()
+    public async Task<T> GetAsync()
     {
         var entidad = new T { Id = _aggregateId };
-        var sobres  = _store.GetEvents(_aggregateId).ToList();
+        var sobres = (await _store.GetEventsAsync(_aggregateId)).ToList();
         entidad.Load(sobres.Select(s => s.EventData));
         _version = sobres.Count == 0 ? 0 : sobres[^1].Version;
         return entidad;
     }
 
-    public void Append(object hecho)
+    public async Task AppendAsync(object hecho)
     {
         _version++;
-        _store.AppendEvent(_aggregateId, new(_version, DateTime.UtcNow, hecho));
+        await _store.AppendEventAsync(_aggregateId, new(_version, DateTime.UtcNow, hecho));
     }
 }
 
-// El motor de replay + el Id del agregado.
 public abstract class AggregateRoot
 {
     public string Id { get; set; } = "";
@@ -119,34 +116,33 @@ public class Empresa : AggregateRoot
 
 public class ReglaDeNegocioException(string mensaje) : Exception(mensaje);
 
-// El comando ahora dice de QUÉ empresa habla.
 public record CambiarPlanDeEmpresa(string EmpresaId, string NuevoPlan);
 public record SuspenderEmpresa(string EmpresaId, string Motivo);
 
+// El contrato, ahora async.
 public interface ICommandHandler<TCommand>
 {
-    void Handle(TCommand comando);
-}
-
-// El handler recibe el almacén y abre el stream por id.
-public class CambiarPlanHandler(InMemoryEventStore store) : ICommandHandler<CambiarPlanDeEmpresa>
-{
-    public void Handle(CambiarPlanDeEmpresa cmd)
-    {
-        var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
-        var empresa = stream.Get();
-        stream.Append(empresa.CambiarPlan(cmd.NuevoPlan));
-    }
+    Task HandleAsync(TCommand comando, CancellationToken ct = default);
 }
 
 public class SuspenderHandler(InMemoryEventStore store) : ICommandHandler<SuspenderEmpresa>
 {
-    public void Handle(SuspenderEmpresa cmd)
+    public async Task HandleAsync(SuspenderEmpresa cmd, CancellationToken ct = default)
     {
         var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
-        var empresa = stream.Get();
+        var empresa = await stream.GetAsync();
         var hecho   = empresa.Suspender(cmd.Motivo);
-        if (hecho is not null) stream.Append(hecho);
+        if (hecho is not null) await stream.AppendAsync(hecho);
+    }
+}
+
+public class CambiarPlanHandler(InMemoryEventStore store) : ICommandHandler<CambiarPlanDeEmpresa>
+{
+    public async Task HandleAsync(CambiarPlanDeEmpresa cmd, CancellationToken ct = default)
+    {
+        var stream  = store.AbrirStream<Empresa>(cmd.EmpresaId);
+        var empresa = await stream.GetAsync();
+        await stream.AppendAsync(empresa.CambiarPlan(cmd.NuevoPlan));
     }
 }
 
