@@ -3,6 +3,8 @@ using JasperFx.Events;
 using Wolverine;
 using Wolverine.Marten;
 using Wolverine.RabbitMQ;
+using Marten.Events.Aggregation;
+using JasperFx.Events.Projections;
 using Microsoft.Extensions.DependencyInjection;
 using JasperFx;
 
@@ -20,6 +22,7 @@ builder.UseWolverine(options =>
         m.UseSystemTextJsonForSerialization();
         m.Events.StreamIdentity   = StreamIdentity.AsString;
         m.Events.EventNamingStyle = EventNamingStyle.SmarterTypeName;
+        m.Projections.Add<EmpresaResumenProjection>(ProjectionLifecycle.Inline);   // §25 CQRS: proyección inline
     })
     .UseLightweightSessions()
     .IntegrateWithWolverine();                                                // Marten + outbox/inbox
@@ -85,6 +88,21 @@ await using (var scope = app.Services.CreateAsyncScope())
     var store = scope.ServiceProvider.GetRequiredService<IEventStore>();
     var empresa = await store.GetAggregateRootAsync<Empresa>("emp-7");
     Console.WriteLine($"{empresa!.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, versión {empresa.Version}");
+}
+
+// 🔍 §25 CQRS: consultar la proyección (modelo de lectura) SIN reproducir streams
+await using (var scope = app.Services.CreateAsyncScope())
+{
+    var store = scope.ServiceProvider.GetRequiredService<IDocumentStore>();
+    await using var querySession = store.QuerySession();
+
+    var suspendidas = await querySession.Query<EmpresaResumen>()
+        .Where(e => e.Suspendida)
+        .ToListAsync(CancellationToken.None);
+
+    Console.WriteLine($"[§25] empresas suspendidas (proyección): {suspendidas.Count}");
+    foreach (var r in suspendidas)
+        Console.WriteLine($"[§25]   - {r.Id}: {r.Nombre}, plan {r.Plan}, suspendida={r.Suspendida}");
 }
 
 Console.WriteLine("[§24] esperando a que el relay durable drene el outbox a RabbitMQ...");
@@ -438,3 +456,20 @@ public record EmpresaRegistrada(string Nombre, string Plan);
 public record PlanCambiado(string NuevoPlan);
 public record EmpresaSuspendida(string Motivo) : IPublicEvent;
 public record EmpresaReactivada()              : IPublicEvent;
+
+// ===================== §25 CQRS: modelo de lectura + proyección =====================
+public class EmpresaResumen
+{
+    public string Id { get; set; } = "";
+    public string Nombre { get; set; } = "";
+    public string Plan { get; set; } = "";
+    public bool   Suspendida { get; set; }
+}
+
+public partial class EmpresaResumenProjection : SingleStreamProjection<EmpresaResumen, string>
+{
+    public void Apply(EmpresaRegistrada e, EmpresaResumen r) { r.Nombre = e.Nombre; r.Plan = e.Plan; }
+    public void Apply(PlanCambiado e, EmpresaResumen r)      => r.Plan = e.NuevoPlan;
+    public void Apply(EmpresaSuspendida e, EmpresaResumen r) => r.Suspendida = true;
+    public void Apply(EmpresaReactivada e, EmpresaResumen r) => r.Suspendida = false;
+}
