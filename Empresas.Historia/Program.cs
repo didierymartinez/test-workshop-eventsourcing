@@ -23,6 +23,10 @@ builder.UseWolverine(options =>
         m.Events.StreamIdentity   = StreamIdentity.AsString;
         m.Events.EventNamingStyle = EventNamingStyle.SmarterTypeName;
         m.Projections.Add<EmpresaResumenProjection>(ProjectionLifecycle.Inline);   // §25 CQRS: proyección inline
+
+        // ===== §27 Multi-tenancy: la llave real es (tenant, id) =====
+        m.Events.TenancyStyle = JasperFx.MultiTenancy.TenancyStyle.Conjoined;   // tablas compartidas + columna tenant_id
+        m.Policies.AllDocumentsAreMultiTenanted();                        // todo documento lleva su tenant
     })
     .UseLightweightSessions()
     .IntegrateWithWolverine();                                                // Marten + outbox/inbox
@@ -56,6 +60,34 @@ if (args.Length > 0)
     return await app.RunJasperFxCommands(args);
 
 await app.StartAsync();   // Wolverine necesita el host ARRANCADO antes de InvokeAsync (no basta Build())
+
+// ===================== §27 Multi-tenancy: dos tenants, el MISMO id, no se pisan =====================
+{
+    var docStore = app.Services.GetRequiredService<IDocumentStore>();
+
+    // sinco/emp-7 y acme/emp-7: mismo id, tenants distintos -> sesión POR TENANT (no por parámetro)
+    await using (var s = docStore.LightweightSession("sinco"))
+    {
+        s.Events.StartStream<Empresa>("emp-7", new EmpresaRegistrada("Constructora Andes", "Básico"));
+        await s.SaveChangesAsync();
+    }
+    await using (var s = docStore.LightweightSession("acme"))
+    {
+        s.Events.StartStream<Empresa>("emp-7", new EmpresaRegistrada("Otra Empresa SA", "Premium"));
+        await s.SaveChangesAsync();
+    }
+
+    await using (var qs = docStore.QuerySession("sinco"))
+    {
+        var emp = await qs.Events.AggregateStreamAsync<Empresa>("emp-7");
+        Console.WriteLine($"[§27] sinco/emp-7 -> {emp!.Nombre}, plan {emp.Plan}");
+    }
+    await using (var qa = docStore.QuerySession("acme"))
+    {
+        var emp = await qa.Events.AggregateStreamAsync<Empresa>("emp-7");
+        Console.WriteLine($"[§27] acme/emp-7  -> {emp!.Nombre}, plan {emp.Plan}");
+    }
+}
 
 // 🔍 Comprueba (§23 outbox/inbox): el relay no duplica
 {
