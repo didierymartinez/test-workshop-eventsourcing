@@ -1,30 +1,76 @@
-// 🔍 Comprueba — sección "El almacén directo (y la Unit of Work)":
-// alta con StartStream → 2 mutaciones cargar→decidir→guardar → rehidratar, sin EventStream ni foreach de drenado.
-var store = new InMemoryEventStore();
+using Microsoft.Extensions.DependencyInjection;
+using Marten;
+using JasperFx.Events;
 
-await new RegistrarEmpresaHandler(store).HandleAsync(new RegistrarEmpresa("emp-7", "Constructora Andes", "Básico"));
-await new CambiarPlanHandler(store).HandleAsync(new CambiarPlanDeEmpresa("emp-7", "Premium"));
-await new SuspenderHandler(store).HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
+// --- Configuración de Marten (en el arranque), con el Postgres de «Docker y PostgreSQL» ---
+var services = new ServiceCollection();
 
-var empresa = await store.GetAggregateRootAsync<Empresa>("emp-7");
-Console.WriteLine($"{empresa!.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, versión {empresa.Version}");
+services.AddMarten(options =>
+{
+    options.Connection("Host=localhost;Port=5432;Database=gestion_eventstore;Username=gestion;Password=dev_local_pwd");
+    options.UseSystemTextJsonForSerialization();
+    options.Events.StreamIdentity   = StreamIdentity.AsString;          // la llave del stream es string (tu Id)
+    options.Events.EventNamingStyle = EventNamingStyle.SmarterTypeName; // guarda el nombre del tipo de evento
+}).UseLightweightSessions();
 
-public class InMemoryEventStore
+// EL SWAP: una línea — antes era InMemoryEventStore
+services.AddScoped<IEventStore, MartenEventStore>();
+
+services.AddScoped<RegistrarEmpresaHandler>();
+services.AddScoped<CambiarPlanHandler>();
+services.AddScoped<SuspenderHandler>();
+
+await using var proveedor = services.BuildServiceProvider();
+
+// Misma operación de «El almacén directo», ahora contra Postgres real vía Marten:
+await using (var scope = proveedor.CreateAsyncScope())
+{
+    var sp = scope.ServiceProvider;
+    await sp.GetRequiredService<RegistrarEmpresaHandler>()
+            .HandleAsync(new RegistrarEmpresa("emp-7", "Constructora Andes", "Básico"));
+}
+await using (var scope = proveedor.CreateAsyncScope())
+{
+    await scope.ServiceProvider.GetRequiredService<CambiarPlanHandler>()
+            .HandleAsync(new CambiarPlanDeEmpresa("emp-7", "Premium"));
+}
+await using (var scope = proveedor.CreateAsyncScope())
+{
+    await scope.ServiceProvider.GetRequiredService<SuspenderHandler>()
+            .HandleAsync(new SuspenderEmpresa("emp-7", "falta de pago"));
+}
+
+await using (var scope = proveedor.CreateAsyncScope())
+{
+    var store = scope.ServiceProvider.GetRequiredService<IEventStore>();
+    var empresa = await store.GetAggregateRootAsync<Empresa>("emp-7");
+    Console.WriteLine($"{empresa!.Nombre}: plan {empresa.Plan}, {(empresa.Suspendida ? "suspendida" : "activa")}, versión {empresa.Version}");
+}
+
+// ===================== El contrato =====================
+public interface IEventStore
+{
+    void StartStream(AggregateRoot agregado);
+    Task<T?> GetAggregateRootAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot, new();
+    void AppendEvent(string id, object hecho);
+    Task SaveChangesAsync(CancellationToken ct = default);
+    Task<bool> ExistsAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot;
+}
+
+// ===================== Implementación 1: en memoria =====================
+public class InMemoryEventStore : IEventStore
 {
     private readonly Dictionary<string, List<EventoAlmacenado>> _cajones = new();
 
-    // La Unit of Work: recuerda qué tocaste en esta operación
-    private readonly List<AggregateRoot> _iniciados   = new();   // nacieron aquí (StartStream)
-    private readonly List<AggregateRoot> _modificados = new();   // se cargaron para mutar (Get)
+    private readonly List<AggregateRoot> _iniciados   = new();
+    private readonly List<AggregateRoot> _modificados = new();
 
-    // ALTA: un agregado nuevo abre su stream
     public void StartStream(AggregateRoot ar)
     {
         if (string.IsNullOrEmpty(ar.Id)) throw new InvalidOperationException("El agregado necesita un Id.");
-        _iniciados.Add(ar);                       // se persiste en SaveChangesAsync, no ya
+        _iniciados.Add(ar);
     }
 
-    // CARGA: rehidrata Y lo apunta como "tocado"
     public Task<T?> GetAggregateRootAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot, new()
     {
         var cajon = _cajones.GetValueOrDefault(id);
@@ -32,14 +78,21 @@ public class InMemoryEventStore
 
         var ar = new T { Id = id };
         ar.Load(cajon.Select(s => s.EventData));
-        _modificados.Add(ar);                     // lo rastreo: al guardar, drenaré sus hechos
+        _modificados.Add(ar);
         return Task.FromResult<T?>(ar);
+    }
+
+    // anexar un hecho suelto a un stream rastreado (parte del contrato IEventStore)
+    public void AppendEvent(string id, object hecho)
+    {
+        var ar = _modificados.FirstOrDefault(a => a.Id == id) ?? _iniciados.FirstOrDefault(a => a.Id == id);
+        if (ar is null) throw new InvalidOperationException($"El stream '{id}' no está rastreado en esta operación.");
+        ar.AppendUncommitted(hecho);
     }
 
     public Task<bool> ExistsAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot =>
         Task.FromResult(_cajones.TryGetValue(id, out var c) && c.Count > 0);
 
-    // GUARDA: drena los hechos pendientes de todo lo rastreado, en un solo paso
     public Task SaveChangesAsync(CancellationToken ct = default)
     {
         foreach (var ar in _iniciados)
@@ -51,11 +104,11 @@ public class InMemoryEventStore
         foreach (var ar in _modificados.Where(a => a.UncommittedEvents.Count > 0))
         {
             var actual = _cajones.TryGetValue(ar.Id, out var c) ? c.Count : 0;
-            if (actual != ar.Version)             // concurrencia optimista, ahora con ar.Version
+            if (actual != ar.Version)
                 throw new ConcurrencyException($"Esperaba la versión {ar.Version} de '{ar.Id}', pero está en {actual}.");
             Volcar(ar, desdeVersion: ar.Version);
         }
-        _iniciados.Clear(); _modificados.Clear();   // limpia el rastreo: la operación terminó
+        _iniciados.Clear(); _modificados.Clear();
         return Task.CompletedTask;
     }
 
@@ -70,6 +123,58 @@ public class InMemoryEventStore
     }
 }
 
+// ===================== Implementación 2: Marten (Postgres real) =====================
+// El change-tracker (Unit of Work), igual que en «El almacén directo» pero como base reutilizable
+public abstract class MartenUnitOfWork
+{
+    private readonly List<AggregateRoot> _modificados = [];
+    private readonly List<AggregateRoot> _iniciados   = [];
+
+    public IEnumerable<AggregateRoot> ModificadosConCambios =>
+        _modificados.Where(ar => ar.UncommittedEvents.Count > 0);
+
+    public void ClearChangeTracker() { _modificados.Clear(); _iniciados.Clear(); }
+    protected void RastrearIniciado(AggregateRoot ar)   => _iniciados.Add(ar);
+    protected void RastrearModificado(AggregateRoot? ar) { if (ar is not null) _modificados.Add(ar); }
+}
+
+// Marten da DOS sesiones (las registra e inyecta AddMarten): IDocumentSession (escribir) e IQuerySession (leer)
+public class MartenEventStore(IDocumentSession session, IQuerySession querySession)
+    : MartenUnitOfWork, IEventStore
+{
+    public void StartStream(AggregateRoot ar)                       // tu StartStream → Marten
+    {
+        if (string.IsNullOrEmpty(ar.Id)) throw new ArgumentException("El agregado necesita un Id.");
+        session.Events.StartStream(ar.Id, ar.UncommittedEvents);
+        RastrearIniciado(ar);
+    }
+
+    public async Task<T?> GetAggregateRootAsync<T>(string id, CancellationToken ct = default)
+        where T : AggregateRoot, new()                             // tu rehidratar → AggregateStreamAsync
+    {
+        var ar = await querySession.Events.AggregateStreamAsync<T>(id, token: ct);
+        if (ar is not null) ar.Id = id;        // el id es la llave del stream: lo estampamos al cargar
+        RastrearModificado(ar);
+        return ar;
+    }
+
+    public void AppendEvent(string id, object hecho) => session.Events.Append(id, hecho);
+
+    public async Task<bool> ExistsAsync<T>(string id, CancellationToken ct = default) where T : AggregateRoot
+        => await querySession.Events.FetchStreamStateAsync(id, ct) is not null;
+
+    public async Task SaveChangesAsync(CancellationToken ct = default)   // tu SaveChanges → session.SaveChangesAsync
+    {
+        foreach (var ar in ModificadosConCambios)
+        {
+            session.Events.Append(ar.Id, ar.UncommittedEvents);
+            ar.ClearUncommittedEvents();
+        }
+        ClearChangeTracker();
+        await session.SaveChangesAsync(ct);
+    }
+}
+
 public class ConcurrencyException(string mensaje) : Exception(mensaje);
 
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
@@ -81,15 +186,16 @@ public abstract class AggregateRoot
     public string Id { get; set; } = "";
     public int Version { get; protected set; }       // el agregado conoce su versión
 
-    // los hechos que el agregado decidió pero aún no se han archivado
     public IReadOnlyList<object> UncommittedEvents => _uncommittedEvents.AsReadOnly();
     public void ClearUncommittedEvents() => _uncommittedEvents.Clear();
 
-    // la empresa "levanta" un hecho: lo encola para que alguien lo persista
+    // permite al almacén anexar un hecho suelto (AppendEvent del contrato)
+    public void AppendUncommitted(object hecho) => _uncommittedEvents.Add(hecho);
+
     protected void Raise(object hecho)
     {
-        _uncommittedEvents.Add(hecho);   // lo recuerda (como en «El agregado que acumula»)
-        Aplicar(hecho);                  // …y ahora también lo aplica al estado
+        _uncommittedEvents.Add(hecho);   // lo recuerda
+        Aplicar(hecho);                  // …y lo aplica al estado
     }
 
     public void Load(IEnumerable<object> historia)
@@ -97,7 +203,7 @@ public abstract class AggregateRoot
         foreach (var hecho in historia)
         {
             Aplicar(hecho);
-            Version++;                                // cada hecho persistido sube la versión cargada
+            Version++;
         }
     }
 
@@ -113,7 +219,6 @@ public class Empresa : AggregateRoot
 
     public Empresa() { }
 
-    // ALTA: el evento de creación NO lleva id; el id es la llave del stream
     public static Empresa Registrar(string id, string nombre, string plan)
     {
         var empresa = new Empresa { Id = id };
@@ -123,22 +228,19 @@ public class Empresa : AggregateRoot
 
     public void CambiarPlan(string nuevoPlan)
     {
-        if (Suspendida)   // validación: inválido → se RECHAZA (grita)
+        if (Suspendida)
             throw new ReglaDeNegocioException("No se puede cambiar el plan de una empresa suspendida.");
-
         Raise(new PlanCambiado(nuevoPlan));
     }
 
     public void Suspender(string motivo)
     {
-        if (Suspendida) return;   // idempotencia: redundante → NO-OP (calla, no encola)
-
+        if (Suspendida) return;
         Raise(new EmpresaSuspendida(motivo));
     }
 
     public void Reactivar() => Raise(new EmpresaReactivada());
 
-    // el dispatcher: el switch ya solo ENRUTA al Apply tipado (sigue siendo el override de la base)
     protected override void Aplicar(object hecho)
     {
         switch (hecho)
@@ -150,7 +252,6 @@ public class Empresa : AggregateRoot
         }
     }
 
-    // un Apply por tipo: aquí vive la mutación de estado (público: la herramienta lo llamará por convención)
     public void Apply(EmpresaRegistrada e) { Nombre = e.Nombre; Plan = e.Plan; }
     public void Apply(PlanCambiado e)      => Plan = e.NuevoPlan;
     public void Apply(EmpresaSuspendida e) => Suspendida = true;
@@ -168,11 +269,11 @@ public interface ICommandHandler<TCommand>
     Task HandleAsync(TCommand comando, CancellationToken ct = default);
 }
 
-public class RegistrarEmpresaHandler(InMemoryEventStore store) : ICommandHandler<RegistrarEmpresa>
+public class RegistrarEmpresaHandler(IEventStore store) : ICommandHandler<RegistrarEmpresa>
 {
     public async Task HandleAsync(RegistrarEmpresa cmd, CancellationToken ct = default)
     {
-        if (await store.ExistsAsync<Empresa>(cmd.EmpresaId, ct))   // ya tiene stream → no se registra dos veces
+        if (await store.ExistsAsync<Empresa>(cmd.EmpresaId, ct))
             throw new InvalidOperationException($"La empresa {cmd.EmpresaId} ya existe.");
         var empresa = Empresa.Registrar(cmd.EmpresaId, cmd.Nombre, cmd.Plan);
         store.StartStream(empresa);
@@ -180,7 +281,7 @@ public class RegistrarEmpresaHandler(InMemoryEventStore store) : ICommandHandler
     }
 }
 
-public class CambiarPlanHandler(InMemoryEventStore store) : ICommandHandler<CambiarPlanDeEmpresa>
+public class CambiarPlanHandler(IEventStore store) : ICommandHandler<CambiarPlanDeEmpresa>
 {
     public async Task HandleAsync(CambiarPlanDeEmpresa cmd, CancellationToken ct = default)
     {
@@ -191,7 +292,7 @@ public class CambiarPlanHandler(InMemoryEventStore store) : ICommandHandler<Camb
     }
 }
 
-public class SuspenderHandler(InMemoryEventStore store) : ICommandHandler<SuspenderEmpresa>
+public class SuspenderHandler(IEventStore store) : ICommandHandler<SuspenderEmpresa>
 {
     public async Task HandleAsync(SuspenderEmpresa cmd, CancellationToken ct = default)
     {
