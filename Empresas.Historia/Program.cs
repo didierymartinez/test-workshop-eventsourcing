@@ -1,35 +1,58 @@
-// El handler orquesta cargar -> actuar -> guardar; el Program solo pide la operación.
+// El stream con su historia previa.
 var stream = new EventStream<Empresa>();
 stream.Append(new EmpresaRegistrada("Constructora Andes", "Básico"));
 
-var handlerCambiar = new CambiarPlanHandler(stream);
-handlerCambiar.Handle("Premium");
+// El despachador: registra cada handler una vez, y enruta por el TIPO del comando.
+var despachador = new Despachador();
+despachador.Registrar(new CambiarPlanHandler(stream));
+despachador.Registrar(new SuspenderHandler(stream));
 
-var handlerSuspender = new SuspenderHandler(stream);
-handlerSuspender.Handle("falta de pago");
+object comando = new SuspenderEmpresa("falta de pago");   // llega como object
+despachador.Enviar(comando);                              // encuentra SuspenderHandler por el tipo
 
 Console.WriteLine(stream.Get().Suspendida ? "suspendida" : "activa");   // suspendida
 
-// Un handler por comando (responsabilidad única): cargar -> decidir -> guardar.
-public class CambiarPlanHandler(EventStream<Empresa> stream)
+// Pieza 1: cada comando es su propio TIPO (un record por intención).
+public record CambiarPlanDeEmpresa(string NuevoPlan);
+public record SuspenderEmpresa(string Motivo);
+
+// Pieza 2: un contrato común para tratar a todos los handlers igual.
+public interface ICommandHandler<TCommand>
 {
-    public void Handle(string nuevoPlan) =>
-        stream.Append(stream.Get().CambiarPlan(nuevoPlan));
+    void Handle(TCommand comando);
 }
 
-public class SuspenderHandler(EventStream<Empresa> stream)
+// El despachador: una tabla tipo -> handler.
+public class Despachador
 {
-    public void Handle(string motivo)
+    private readonly Dictionary<Type, Action<object>> _handlers = new();
+
+    public void Registrar<T>(ICommandHandler<T> handler)
+        => _handlers[typeof(T)] = (object comando) => handler.Handle((T)comando);
+
+    public void Enviar(object comando)
+        => _handlers[comando.GetType()](comando);
+}
+
+// Handlers: ahora reciben su comando (record) e implementan el contrato.
+public class CambiarPlanHandler(EventStream<Empresa> stream) : ICommandHandler<CambiarPlanDeEmpresa>
+{
+    public void Handle(CambiarPlanDeEmpresa cmd) =>
+        stream.Append(stream.Get().CambiarPlan(cmd.NuevoPlan));
+}
+
+public class SuspenderHandler(EventStream<Empresa> stream) : ICommandHandler<SuspenderEmpresa>
+{
+    public void Handle(SuspenderEmpresa cmd)
     {
-        var hecho = stream.Get().Suspender(motivo);
+        var hecho = stream.Get().Suspender(cmd.Motivo);
         if (hecho is not null) stream.Append(hecho);
     }
 }
 
-// El sobre: envuelve el hecho con su POSICIÓN (versión) y cuándo se anotó.
+// El sobre: hecho + posición (versión) + fecha.
 public record EventoAlmacenado(int Version, DateTime Timestamp, object EventData);
 
-// El envoltorio genérico: ahora numera cada hecho en un sobre.
 public class EventStream<T> where T : AggregateRoot, new()
 {
     private readonly List<EventoAlmacenado> _historia = new();
@@ -41,12 +64,11 @@ public class EventStream<T> where T : AggregateRoot, new()
     public T Get()
     {
         var entidad = new T();
-        entidad.Load(_historia.Select(s => s.EventData));   // solo el hecho, no el sobre
+        entidad.Load(_historia.Select(s => s.EventData));
         return entidad;
     }
 }
 
-// El motor de replay: una sola vez, en la base.
 public abstract class AggregateRoot
 {
     public void Load(IEnumerable<object> historia)
@@ -58,7 +80,6 @@ public abstract class AggregateRoot
     protected abstract void Aplicar(object hecho);
 }
 
-// La empresa: decide (emite hechos protegiendo reglas) y aplica (en el replay).
 public class Empresa : AggregateRoot
 {
     public string Nombre { get; private set; } = "";
