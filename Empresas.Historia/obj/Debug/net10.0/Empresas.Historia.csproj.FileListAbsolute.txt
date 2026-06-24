@@ -1,0 +1,15 @@
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/bin/Debug/net10.0/Empresas.Historia
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/bin/Debug/net10.0/Empresas.Historia.deps.json
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/bin/Debug/net10.0/Empresas.Historia.runtimeconfig.json
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/bin/Debug/net10.0/Empresas.Historia.dll
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/bin/Debug/net10.0/Empresas.Historia.pdb
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.GeneratedMSBuildEditorConfig.editorconfig
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.AssemblyInfoInputs.cache
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.AssemblyInfo.cs
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.csproj.CoreCompileInputs.cache
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.sourcelink.json
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.dll
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/refint/Empresas.Historia.dll
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.pdb
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/Empresas.Historia.genruntimeconfig.cache
+/Users/didierymartinez/test-workshop-es/Empresas.Historia/obj/Debug/net10.0/ref/Empresas.Historia.dll
